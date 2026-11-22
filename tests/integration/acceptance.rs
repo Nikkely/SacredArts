@@ -630,6 +630,20 @@ fn t09_isolation() {
     m.invoke(&sid, "write", json!({"fd": h, "data": "junk\n{\"type\":\"bogus\"}\n"}))
         .ok();
     m.invoke(&sid, "getpid", json!({})).ok();
+    // stderr without newlines (/proc/1/fd/2 reaches the host's stderr reader)
+    // and many inspect-only requests must not make anything buffer unboundedly
+    let e = m
+        .invoke(&sid, "openat", json!({"path": "/proc/1/fd/2", "flags": ["O_WRONLY"]}))
+        .ok();
+    let e = e.v["return_value"].as_i64().unwrap();
+    for _ in 0..8 {
+        m.invoke(&sid, "write", json!({"fd": e, "data": "y".repeat(65536)}))
+            .ok();
+    }
+    for _ in 0..50 {
+        m.tool("sandbox_inspect", json!({"session_id": sid})).ok();
+    }
+    m.invoke(&sid, "getpid", json!({})).ok();
 
     // container hardening as actually applied by Docker
     let (_, hc) = docker(&["inspect", "--format", "{{json .HostConfig}}", &name]);

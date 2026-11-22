@@ -11,7 +11,9 @@
 use crate::parse::{TraceLine, parse_line};
 use sacredarts_core::Policy;
 use sacredarts_core::ipc::*;
-use sacredarts_core::limits::{MAX_IPC_LINE_BYTES, MAX_OBSERVED_PER_REQUEST};
+use sacredarts_core::limits::{
+    MAX_DIAG_LINE_BYTES, MAX_IPC_LINE_BYTES, MAX_OBSERVED_PER_REQUEST, MAX_QUEUED_TRACE_LINES, MAX_TRACE_LINE_BYTES,
+};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -21,7 +23,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -68,6 +70,18 @@ static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
 fn log(msg: impl AsRef<str>) {
     eprintln!("[sacredarts-supervisor] {}", msg.as_ref());
+}
+
+/// Lines of at most `max` bytes (longer lines are split), so a writer that
+/// never sends a newline cannot make the reader buffer without bound.
+fn bounded_lines<R: BufRead>(mut r: R, max: usize) -> impl Iterator<Item = String> {
+    std::iter::from_fn(move || {
+        let mut buf = Vec::new();
+        match (&mut r).take(max as u64).read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(String::from_utf8_lossy(&buf).into_owned()),
+        }
+    })
 }
 
 /// The name contains a random part, so there is never a stale file to remove.
@@ -138,30 +152,25 @@ impl RunnerProc {
                     .tmp
                     .join(format!(".sacredarts-trace-{generation}-{:016x}.fifo", random_u64()));
                 mkfifo(&fifo).map_err(|e| format!("mkfifo {}: {e}", fifo.display()))?;
-                let (tx, rx) = mpsc::channel();
+                // Bounded: lines nobody asked for (e.g. the runner's IPC during
+                // sandbox_inspect) must not pile up.
+                let (tx, rx) = mpsc::sync_channel(MAX_QUEUED_TRACE_LINES);
                 let fifo2 = fifo.clone();
                 std::thread::spawn(move || {
                     // Blocks until strace opens the FIFO for writing.
                     match File::open(&fifo2) {
                         Ok(f) => {
                             let _ = std::fs::remove_file(&fifo2);
-                            let mut r = BufReader::new(f);
-                            let mut line = String::new();
-                            loop {
-                                line.clear();
-                                match (&mut r).take(MAX_IPC_LINE_BYTES as u64).read_line(&mut line) {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(_) => {
-                                        if tx.send(TraceEvent::Line(line.clone())).is_err() {
-                                            return;
-                                        }
-                                    }
+                            for line in bounded_lines(BufReader::new(f), MAX_TRACE_LINE_BYTES) {
+                                // Never block strace (and so the runner): drop when full.
+                                if let Err(TrySendError::Disconnected(_)) = tx.try_send(TraceEvent::Line(line)) {
+                                    return;
                                 }
                             }
                         }
                         Err(e) => log(format!("cannot open trace fifo: {e}")),
                     }
-                    let _ = tx.send(TraceEvent::Eof);
+                    let _ = tx.try_send(TraceEvent::Eof);
                 });
                 trace = Some(Trace { rx, fifo: fifo.clone() });
                 let mut c = Command::new(strace_bin);
@@ -189,7 +198,8 @@ impl RunnerProc {
         if let Some(err) = child.stderr.take() {
             let tail = stderr_tail.clone();
             std::thread::spawn(move || {
-                for line in BufReader::new(err).lines().map_while(Result::ok) {
+                for line in bounded_lines(BufReader::new(err), MAX_DIAG_LINE_BYTES) {
+                    let line = line.trim_end().to_string();
                     log(format!("runner gen{generation}: {line}"));
                     if let Ok(mut t) = tail.lock() {
                         if t.len() >= 20 {
@@ -310,6 +320,11 @@ impl RunnerProc {
     fn request(&mut self, op: RunnerOp, timeout: Duration) -> Result<(u64, RunnerReplyBody), ReqError> {
         let id = self.next_id;
         self.next_id += 1;
+        // Trace lines from earlier non-invoke requests are of no use; observe()
+        // only looks between this request's markers.
+        if let Some(t) = &self.trace {
+            while t.rx.try_recv().is_ok() {}
+        }
         let s = serde_json::to_string(&RunnerRequest { id, op }).map_err(|e| ReqError::Crashed(e.to_string()))?;
         let mut w = &self.sock;
         w.write_all(s.as_bytes())
@@ -702,4 +717,16 @@ fn list_workspace(dir: &Path) -> Vec<WorkspaceEntry> {
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_lines_split_long_input() {
+        let input = format!("short\n{}\nend", "x".repeat(10));
+        let lines: Vec<String> = bounded_lines(input.as_bytes(), 4).collect();
+        assert_eq!(lines, ["shor", "t\n", "xxxx", "xxxx", "xx\n", "end"]);
+    }
 }

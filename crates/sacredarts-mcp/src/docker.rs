@@ -7,7 +7,7 @@
 use crate::config::Config;
 use crate::errors::ToolError;
 use sacredarts_core::ipc::{HostMessage, SupervisorMessage};
-use sacredarts_core::limits::MAX_IPC_LINE_BYTES;
+use sacredarts_core::limits::{MAX_DIAG_LINE_BYTES, MAX_IPC_LINE_BYTES};
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -191,8 +191,20 @@ impl Docker {
             let tail = stderr_tail.clone();
             let sid = session_id.to_string();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(err).lines();
-                while let Ok(Some(l)) = lines.next_line().await {
+                // Read in bounded pieces: the learner can write to the
+                // supervisor's stderr without ever sending a newline.
+                let mut reader = BufReader::new(err);
+                loop {
+                    let mut buf = Vec::new();
+                    match (&mut reader)
+                        .take(MAX_DIAG_LINE_BYTES as u64)
+                        .read_until(b'\n', &mut buf)
+                        .await
+                    {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let l = String::from_utf8_lossy(&buf).trim_end().to_string();
                     tracing::debug!(session = %sid, "sandbox: {l}");
                     if let Ok(mut t) = tail.lock() {
                         if t.len() >= 30 {

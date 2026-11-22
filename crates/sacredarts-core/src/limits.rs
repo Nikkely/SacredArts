@@ -14,6 +14,16 @@ pub const MAX_PATH_BYTES: usize = 64 * 1024;
 pub const MAX_IO_BYTES: usize = 64 * 1024;
 /// Maximum size of one JSON line on any internal IPC channel.
 pub const MAX_IPC_LINE_BYTES: usize = 4 * 1024 * 1024;
+/// Diagnostic (stderr) lines are split at this size, so a writer that never
+/// sends a newline cannot make a reader buffer without bound.
+pub const MAX_DIAG_LINE_BYTES: usize = 4 * 1024;
+/// strace lines queued between the FIFO reader and the supervisor. Lines
+/// beyond this are dropped (an observation that loses its end marker is
+/// reported as incomplete).
+pub const MAX_QUEUED_TRACE_LINES: usize = 1024;
+/// Maximum size of one strace output line (`-s 64` keeps real lines far
+/// smaller; escaped PATH_MAX paths stay below this).
+pub const MAX_TRACE_LINE_BYTES: usize = 64 * 1024;
 /// Maximum number of strace lines kept for one request.
 pub const MAX_OBSERVED_PER_REQUEST: usize = 256;
 /// Prefix of the marker paths the runner passes to `faccessat` so that the
