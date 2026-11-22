@@ -227,6 +227,14 @@ fn fill(template: &str, v: &InvocationView<'_>) -> String {
     out.trim().to_string()
 }
 
+/// Build text with `writeln!(s, ..)?`. Writing to a `String` cannot fail,
+/// so the `fmt::Result` only exists to allow `?`. Trailing whitespace is trimmed.
+fn text(build: impl FnOnce(&mut String) -> std::fmt::Result) -> String {
+    let mut s = String::new();
+    build(&mut s).expect("writing to a String cannot fail");
+    s.trim_end().to_string()
+}
+
 /// strace lines shown at every level when TraceMode::All.
 fn observed_lines(v: &InvocationView<'_>) -> Vec<String> {
     match v.observation {
@@ -234,11 +242,11 @@ fn observed_lines(v: &InvocationView<'_>) -> Vec<String> {
             .syscalls
             .iter()
             .map(|s| {
-                let mut l = format!("{}({}) = {}", s.syscall, s.args, s.return_raw);
-                if let Some(d) = s.duration_ns {
-                    let _ = write!(l, " <{:.6}>", d as f64 / 1e9);
+                let line = format!("{}({}) = {}", s.syscall, s.args, s.return_raw);
+                match s.duration_ns {
+                    Some(d) => format!("{line} <{:.6}>", d as f64 / 1e9),
+                    None => line,
                 }
-                l
             })
             .collect(),
         _ => vec![],
@@ -268,27 +276,28 @@ fn level1(v: &InvocationView<'_>) -> String {
 }
 
 fn explanation(g: &SyscallGuide, v: &InvocationView<'_>) -> String {
-    let mut s = g.description.trim().to_string();
-    s.push_str("\n\n");
-    match v.errno {
-        None => s.push_str(&fill(&g.explain.success, v)),
-        Some(e) => {
-            s.push_str(&fill(&g.explain.failure, v));
-            if !v.executed {
-                let _ = write!(s, "\n要求された {} はカーネルに発行されていません。", g.name);
-            } else if v.denied_by_policy {
-                let _ = write!(
-                    s,
-                    "\nこれはファイルシステムの問題ではありません。現在のポリシーで {0} が deny されているため、\
+    text(|s| {
+        writeln!(s, "{}\n", g.description.trim())?;
+        match v.errno {
+            None => s.push_str(&fill(&g.explain.success, v)),
+            Some(e) => {
+                s.push_str(&fill(&g.explain.failure, v));
+                if !v.executed {
+                    write!(s, "\n要求された {} はカーネルに発行されていません。", g.name)?;
+                } else if v.denied_by_policy {
+                    write!(
+                        s,
+                        "\nこれはファイルシステムの問題ではありません。現在のポリシーで {0} が deny されているため、\
                      カーネルの seccomp フィルタが {0} の実行前に {1} を返しました。",
-                    g.name, e.name
-                );
-            } else if let Some(d) = g.errors.iter().find(|x| x.name == e.name) {
-                let _ = write!(s, "\n{}: {}", e.name, d.description.trim());
+                        g.name, e.name
+                    )?;
+                } else if let Some(d) = g.errors.iter().find(|x| x.name == e.name) {
+                    write!(s, "\n{}: {}", e.name, d.description.trim())?;
+                }
             }
         }
-    }
-    s
+        Ok(())
+    })
 }
 
 fn arg_values(req: &SyscallRequest, v: &InvocationView<'_>) -> Vec<(String, String)> {
@@ -343,144 +352,145 @@ fn purpose_label(p: IssuedPurpose) -> &'static str {
 }
 
 fn level3(g: &SyscallGuide, v: &InvocationView<'_>) -> String {
-    let mut s = String::new();
-    let _ = writeln!(s, "## 目的\n{}", g.purpose.trim());
-    let _ = writeln!(s, "\n## C の関数シグネチャ\n```c\n{}\n```", g.signature.trim());
+    text(|s| {
+        writeln!(s, "## 目的\n{}", g.purpose.trim())?;
+        writeln!(s, "\n## C の関数シグネチャ\n```c\n{}\n```", g.signature.trim())?;
 
-    let values = arg_values(v.request, v);
-    if !g.arguments.is_empty() {
-        let _ = writeln!(s, "\n## 引数（今回の値）");
-        for a in &g.arguments {
-            let val = values
-                .iter()
-                .find(|(n, _)| *n == a.name)
-                .map(|(_, x)| x.as_str())
-                .unwrap_or("-");
-            let _ = writeln!(s, "- `{}` ({}) = {}\n  {}", a.name, a.ty, val, a.description.trim());
+        let values = arg_values(v.request, v);
+        if !g.arguments.is_empty() {
+            writeln!(s, "\n## 引数（今回の値）")?;
+            for a in &g.arguments {
+                let val = values
+                    .iter()
+                    .find(|(n, _)| *n == a.name)
+                    .map(|(_, x)| x.as_str())
+                    .unwrap_or("-");
+                writeln!(s, "- `{}` ({}) = {}\n  {}", a.name, a.ty, val, a.description.trim())?;
+            }
         }
-    }
 
-    if let SyscallRequest::Openat { flags, raw_flags, .. } = v.request {
-        let _ = writeln!(s, "\n## 使用したフラグ");
-        for f in flags {
-            let d = g
-                .flags
-                .iter()
-                .find(|x| x.name == f.as_str())
-                .map(|x| x.description.trim())
-                .unwrap_or("");
-            let _ = writeln!(s, "- `{}`: {}", f.as_str(), d);
+        if let SyscallRequest::Openat { flags, raw_flags, .. } = v.request {
+            writeln!(s, "\n## 使用したフラグ")?;
+            for f in flags {
+                let d = g
+                    .flags
+                    .iter()
+                    .find(|x| x.name == f.as_str())
+                    .map(|x| x.description.trim())
+                    .unwrap_or("");
+                writeln!(s, "- `{}`: {}", f.as_str(), d)?;
+            }
+            if *raw_flags != 0 {
+                writeln!(
+                    s,
+                    "- `{raw_flags:#x}`: 数値で指定されたビット（そのままカーネルに渡しました。名前付きの解釈は「発行した syscall」の行を参照）"
+                )?;
+            }
         }
-        if *raw_flags != 0 {
-            let _ = writeln!(
+
+        writeln!(s, "\n## 戻り値")?;
+        match (v.errno, v.request, v.handle) {
+            (None, SyscallRequest::Openat { .. }, Some(h)) => {
+                writeln!(s, "今回: `{}`（カーネルが返したファイルディスクリプタ）", h.real_fd)?;
+            }
+            (None, _, _) => {
+                writeln!(s, "今回: `{}`", v.ret)?;
+            }
+            (Some(_), _, _) => {
+                writeln!(s, "今回: `-1`")?;
+            }
+        }
+        writeln!(s, "一般: {}", g.return_value.trim())?;
+
+        writeln!(s, "\n## errno")?;
+        match v.errno {
+            Some(e) => {
+                writeln!(s, "今回: `{}` ({}) = {}", e.name, e.code, e.message)?;
+            }
+            None => {
+                writeln!(s, "今回: なし（成功）")?;
+            }
+        }
+        writeln!(s, "起こりうる主な errno:")?;
+        for e in &g.errors {
+            writeln!(s, "- `{}`: {}", e.name, e.description.trim())?;
+        }
+
+        writeln!(s, "\n## 実行による状態変化")?;
+        match (v.handle, v.request, v.errno) {
+            (Some(h), SyscallRequest::Openat { .. }, None) => {
+                writeln!(
+                    s,
+                    "今回（実測）: fd {}（{}）がプロセスの fd テーブルに追加されました。",
+                    h.real_fd, h.path
+                )?;
+            }
+            (Some(h), SyscallRequest::Close { .. }, _) => {
+                writeln!(
+                    s,
+                    "今回（実測）: fd {}（{}）がプロセスの fd テーブルから削除されました。",
+                    h.real_fd, h.path
+                )?;
+            }
+            (_, _, Some(_)) => {
+                writeln!(s, "今回（実測）: 失敗したため、fd テーブルは変化していません。")?;
+            }
+            _ => {}
+        }
+        writeln!(s, "一般:")?;
+        for c in &g.state_changes {
+            writeln!(s, "- {}", c.trim())?;
+        }
+
+        writeln!(s, "\n## 【実測】カーネルに発行された syscall")?;
+        writeln!(s, "Runner の自己申告（実 fd で表示）:")?;
+        for c in v.issued {
+            let ret = match &c.errno {
+                Some(e) => format!("-1 {e}"),
+                None => c.ret.to_string(),
+            };
+            writeln!(
                 s,
-                "- `{raw_flags:#x}`: 数値で指定されたビット（そのままカーネルに渡しました。名前付きの解釈は「発行した syscall」の行を参照）"
-            );
+                "  {}({}) = {}    [{}]",
+                c.syscall,
+                c.args,
+                ret,
+                purpose_label(c.purpose)
+            )?;
         }
-    }
+        match v.observation.map(|o| o.status) {
+            Some(ObservationStatus::Complete) | Some(ObservationStatus::Incomplete) => {
+                writeln!(s, "strace による観測:")?;
+                for l in observed_lines(v) {
+                    writeln!(s, "  {l}")?;
+                }
+                if v.observation.map(|o| o.status) == Some(ObservationStatus::Incomplete) {
+                    writeln!(s, "  （観測は不完全です）")?;
+                }
+            }
+            _ => {
+                writeln!(s, "strace による観測: このサンドボックスでは利用できません。")?;
+            }
+        }
 
-    let _ = writeln!(s, "\n## 戻り値");
-    match (v.errno, v.request, v.handle) {
-        (None, SyscallRequest::Openat { .. }, Some(h)) => {
-            let _ = writeln!(s, "今回: `{}`（カーネルが返したファイルディスクリプタ）", h.real_fd);
-        }
-        (None, _, _) => {
-            let _ = writeln!(s, "今回: `{}`", v.ret);
-        }
-        (Some(_), _, _) => {
-            let _ = writeln!(s, "今回: `-1`");
-        }
-    }
-    let _ = writeln!(s, "一般: {}", g.return_value.trim());
-
-    let _ = writeln!(s, "\n## errno");
-    match v.errno {
-        Some(e) => {
-            let _ = writeln!(s, "今回: `{}` ({}) = {}", e.name, e.code, e.message);
-        }
-        None => {
-            let _ = writeln!(s, "今回: なし（成功）");
-        }
-    }
-    let _ = writeln!(s, "起こりうる主な errno:");
-    for e in &g.errors {
-        let _ = writeln!(s, "- `{}`: {}", e.name, e.description.trim());
-    }
-
-    let _ = writeln!(s, "\n## 実行による状態変化");
-    match (v.handle, v.request, v.errno) {
-        (Some(h), SyscallRequest::Openat { .. }, None) => {
-            let _ = writeln!(
-                s,
-                "今回（実測）: fd {}（{}）がプロセスの fd テーブルに追加されました。",
-                h.real_fd, h.path
-            );
-        }
-        (Some(h), SyscallRequest::Close { .. }, _) => {
-            let _ = writeln!(
-                s,
-                "今回（実測）: fd {}（{}）がプロセスの fd テーブルから削除されました。",
-                h.real_fd, h.path
-            );
-        }
-        (_, _, Some(_)) => {
-            let _ = writeln!(s, "今回（実測）: 失敗したため、fd テーブルは変化していません。");
-        }
-        _ => {}
-    }
-    let _ = writeln!(s, "一般:");
-    for c in &g.state_changes {
-        let _ = writeln!(s, "- {}", c.trim());
-    }
-
-    let _ = writeln!(s, "\n## 【実測】カーネルに発行された syscall");
-    let _ = writeln!(s, "Runner の自己申告（実 fd で表示）:");
-    for c in v.issued {
-        let ret = match &c.errno {
-            Some(e) => format!("-1 {e}"),
-            None => c.ret.to_string(),
-        };
-        let _ = writeln!(
+        writeln!(
             s,
-            "  {}({}) = {}    [{}]",
-            c.syscall,
-            c.args,
-            ret,
-            purpose_label(c.purpose)
-        );
-    }
-    match v.observation.map(|o| o.status) {
-        Some(ObservationStatus::Complete) | Some(ObservationStatus::Incomplete) => {
-            let _ = writeln!(s, "strace による観測:");
-            for l in observed_lines(v) {
-                let _ = writeln!(s, "  {l}");
-            }
-            if v.observation.map(|o| o.status) == Some(ObservationStatus::Incomplete) {
-                let _ = writeln!(s, "  （観測は不完全です）");
-            }
-        }
-        _ => {
-            let _ = writeln!(s, "strace による観測: このサンドボックスでは利用できません。");
-        }
-    }
-
-    let _ = writeln!(
-        s,
-        "\n## 【一般的な仕様】関連する Linux の内部概念\n\
+            "\n## 【一般的な仕様】関連する Linux の内部概念\n\
          ※ 以下は Linux man-pages などに基づく一般的な説明です。SacredArts はカーネル内部（VFS 等）を直接観測していません。"
-    );
-    for c in &g.concepts {
-        let _ = writeln!(s, "- **{}**: {}", c.name, c.description.trim().replace('\n', " "));
-    }
-    if !g.notes.is_empty() || !v.notes.is_empty() {
-        let _ = writeln!(s, "\n## 補足");
-        for n in v.notes.iter().chain(g.notes.iter()) {
-            let _ = writeln!(s, "- {}", n.trim().replace('\n', " "));
+        )?;
+        for c in &g.concepts {
+            writeln!(s, "- **{}**: {}", c.name, c.description.trim().replace('\n', " "))?;
         }
-    }
-    let _ = writeln!(s, "\n## 関連する syscall\n{}", g.related.join(", "));
-    let _ = writeln!(s, "\n## 参考 man page\n{}", g.man_pages.join(", "));
-    s.trim_end().to_string()
+        if !g.notes.is_empty() || !v.notes.is_empty() {
+            writeln!(s, "\n## 補足")?;
+            for n in v.notes.iter().chain(g.notes.iter()) {
+                writeln!(s, "- {}", n.trim().replace('\n', " "))?;
+            }
+        }
+        writeln!(s, "\n## 関連する syscall\n{}", g.related.join(", "))?;
+        writeln!(s, "\n## 参考 man page\n{}", g.man_pages.join(", "))?;
+        Ok(())
+    })
 }
 
 pub fn render_invocation(guides: &Guides, level: GuideLevel, v: &InvocationView<'_>) -> Rendered {
@@ -520,50 +530,52 @@ pub fn render_invocation(guides: &Guides, level: GuideLevel, v: &InvocationView<
 
 /// `syscall_describe`: specification only, no execution context.
 pub fn render_describe(g: &SyscallGuide, level: GuideLevel) -> String {
-    let mut s = format!("{} — {}\n", g.name, g.summary);
-    let _ = writeln!(s, "```c\n{}\n```", g.signature.trim());
-    if !g.executable {
-        let _ = writeln!(s, "※ SacredArts では {} は実行できません（説明のみ）。", g.name);
-    }
-    if level == GuideLevel::LineOnly {
-        return s.trim_end().to_string();
-    }
-    let _ = writeln!(s, "\n{}", g.description.trim());
-    for n in &g.notes {
-        let _ = writeln!(s, "\n補足: {}", n.trim().replace('\n', " "));
-    }
-    let _ = writeln!(s, "\n関連: {}", g.related.join(", "));
-    if level == GuideLevel::Explained {
-        return s.trim_end().to_string();
-    }
-    let _ = writeln!(s, "\n## 目的\n{}", g.purpose.trim());
-    if !g.arguments.is_empty() {
-        let _ = writeln!(s, "\n## 引数");
-        for a in &g.arguments {
-            let _ = writeln!(s, "- `{}` ({}): {}", a.name, a.ty, a.description.trim());
+    text(|s| {
+        writeln!(s, "{} — {}", g.name, g.summary)?;
+        writeln!(s, "```c\n{}\n```", g.signature.trim())?;
+        if !g.executable {
+            writeln!(s, "※ SacredArts では {} は実行できません（説明のみ）。", g.name)?;
         }
-    }
-    if !g.flags.is_empty() {
-        let _ = writeln!(s, "\n## フラグ");
-        for f in &g.flags {
-            let _ = writeln!(s, "- `{}`: {}", f.name, f.description.trim());
+        if level == GuideLevel::LineOnly {
+            return Ok(());
         }
-    }
-    let _ = writeln!(s, "\n## 戻り値\n{}", g.return_value.trim());
-    let _ = writeln!(s, "\n## 主な errno");
-    for e in &g.errors {
-        let _ = writeln!(s, "- `{}`: {}", e.name, e.description.trim());
-    }
-    let _ = writeln!(s, "\n## 状態変化");
-    for c in &g.state_changes {
-        let _ = writeln!(s, "- {}", c.trim());
-    }
-    let _ = writeln!(s, "\n## 関連する Linux の内部概念（一般的な説明）");
-    for c in &g.concepts {
-        let _ = writeln!(s, "- **{}**: {}", c.name, c.description.trim().replace('\n', " "));
-    }
-    let _ = writeln!(s, "\n## 参考 man page\n{}", g.man_pages.join(", "));
-    s.trim_end().to_string()
+        writeln!(s, "\n{}", g.description.trim())?;
+        for n in &g.notes {
+            writeln!(s, "\n補足: {}", n.trim().replace('\n', " "))?;
+        }
+        writeln!(s, "\n関連: {}", g.related.join(", "))?;
+        if level == GuideLevel::Explained {
+            return Ok(());
+        }
+        writeln!(s, "\n## 目的\n{}", g.purpose.trim())?;
+        if !g.arguments.is_empty() {
+            writeln!(s, "\n## 引数")?;
+            for a in &g.arguments {
+                writeln!(s, "- `{}` ({}): {}", a.name, a.ty, a.description.trim())?;
+            }
+        }
+        if !g.flags.is_empty() {
+            writeln!(s, "\n## フラグ")?;
+            for f in &g.flags {
+                writeln!(s, "- `{}`: {}", f.name, f.description.trim())?;
+            }
+        }
+        writeln!(s, "\n## 戻り値\n{}", g.return_value.trim())?;
+        writeln!(s, "\n## 主な errno")?;
+        for e in &g.errors {
+            writeln!(s, "- `{}`: {}", e.name, e.description.trim())?;
+        }
+        writeln!(s, "\n## 状態変化")?;
+        for c in &g.state_changes {
+            writeln!(s, "- {}", c.trim())?;
+        }
+        writeln!(s, "\n## 関連する Linux の内部概念（一般的な説明）")?;
+        for c in &g.concepts {
+            writeln!(s, "- **{}**: {}", c.name, c.description.trim().replace('\n', " "))?;
+        }
+        writeln!(s, "\n## 参考 man page\n{}", g.man_pages.join(", "))?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]

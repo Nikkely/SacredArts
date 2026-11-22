@@ -70,8 +70,8 @@ fn log(msg: impl AsRef<str>) {
     eprintln!("[sacredarts-supervisor] {}", msg.as_ref());
 }
 
+/// The name contains a random part, so there is never a stale file to remove.
 fn mkfifo(path: &Path) -> io::Result<()> {
-    let _ = std::fs::remove_file(path);
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
     // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
@@ -291,7 +291,9 @@ impl RunnerProc {
     }
 
     fn read_line(&mut self, timeout: Duration) -> Result<String, ReqError> {
-        let _ = self.sock.set_read_timeout(Some(timeout));
+        self.sock
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| ReqError::Crashed(format!("cannot set the IPC timeout: {e}")))?;
         let mut line = String::new();
         match (&mut self.reader).take(MAX_IPC_LINE_BYTES as u64).read_line(&mut line) {
             Ok(0) => Err(ReqError::Crashed("runner closed the connection".into())),
@@ -397,9 +399,10 @@ fn send(msg: &SupervisorMessage) {
     let s = serde_json::to_string(msg)
         .unwrap_or_else(|e| format!(r#"{{"type":"init_failed","message":"serialize: {e}"}}"#));
     let mut out = io::stdout().lock();
-    let _ = out.write_all(s.as_bytes());
-    let _ = out.write_all(b"\n");
-    let _ = out.flush();
+    if let Err(e) = writeln!(out, "{s}").and_then(|()| out.flush()) {
+        // The host is gone; it will notice through the closed pipe.
+        log(format!("cannot write to the host: {e}"));
+    }
 }
 
 impl Supervisor {
