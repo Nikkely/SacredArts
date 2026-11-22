@@ -495,16 +495,16 @@ pub fn render_invocation(guides: &Guides, level: GuideLevel, v: &InvocationView<
         };
     };
     match level {
-        GuideLevel::Level1 => Rendered {
+        GuideLevel::LineOnly => Rendered {
             level: 1,
             summary: g.summary.clone(),
             explanation: None,
             text: l1,
         },
-        GuideLevel::Level2 | GuideLevel::Level3 => {
+        GuideLevel::Explained | GuideLevel::Detailed => {
             let exp = explanation(g, v);
             let mut text = format!("{l1}\n\n解説:\n{exp}");
-            if level == GuideLevel::Level3 {
+            if level == GuideLevel::Detailed {
                 text.push_str("\n\n");
                 text.push_str(&level3(g, v));
             }
@@ -525,7 +525,7 @@ pub fn render_describe(g: &SyscallGuide, level: GuideLevel) -> String {
     if !g.executable {
         let _ = writeln!(s, "※ SacredArts では {} は実行できません（説明のみ）。", g.name);
     }
-    if level == GuideLevel::Level1 {
+    if level == GuideLevel::LineOnly {
         return s.trim_end().to_string();
     }
     let _ = writeln!(s, "\n{}", g.description.trim());
@@ -533,7 +533,7 @@ pub fn render_describe(g: &SyscallGuide, level: GuideLevel) -> String {
         let _ = writeln!(s, "\n補足: {}", n.trim().replace('\n', " "));
     }
     let _ = writeln!(s, "\n関連: {}", g.related.join(", "));
-    if level == GuideLevel::Level2 {
+    if level == GuideLevel::Explained {
         return s.trim_end().to_string();
     }
     let _ = writeln!(s, "\n## 目的\n{}", g.purpose.trim());
@@ -639,9 +639,9 @@ mod tests {
         }];
         let g = Guides::builtin();
         let v = view(&req, Some(&h), &issued, None, TraceMode::Requested);
-        let r1 = render_invocation(g, GuideLevel::Level1, &v);
-        let r2 = render_invocation(g, GuideLevel::Level2, &v);
-        let r3 = render_invocation(g, GuideLevel::Level3, &v);
+        let r1 = render_invocation(g, GuideLevel::LineOnly, &v);
+        let r2 = render_invocation(g, GuideLevel::Explained, &v);
+        let r3 = render_invocation(g, GuideLevel::Detailed, &v);
         assert_eq!(
             r1.text,
             "openat(AT_FDCWD, \"/workspace/hello.txt\", O_WRONLY|O_CREAT, 0644) = 3"
@@ -685,12 +685,12 @@ mod tests {
         let g = Guides::builtin();
         let a = render_invocation(
             g,
-            GuideLevel::Level1,
+            GuideLevel::LineOnly,
             &view(&req, None, &[], Some(&obs), TraceMode::Requested),
         );
         let b = render_invocation(
             g,
-            GuideLevel::Level1,
+            GuideLevel::LineOnly,
             &view(&req, None, &[], Some(&obs), TraceMode::All),
         );
         assert!(!a.text.contains("strace"));
@@ -713,15 +713,15 @@ mod tests {
         v.errno = Some(&e);
         v.ret = -1;
         v.denied_by_policy = true;
-        let r = render_invocation(Guides::builtin(), GuideLevel::Level2, &v);
+        let r = render_invocation(Guides::builtin(), GuideLevel::Explained, &v);
         assert!(r.text.contains("seccomp フィルタ"), "{}", r.text);
     }
 
     #[test]
     fn describe_levels() {
         let g = Guides::builtin().get("open").unwrap();
-        let l1 = render_describe(g, GuideLevel::Level1);
-        let l3 = render_describe(g, GuideLevel::Level3);
+        let l1 = render_describe(g, GuideLevel::LineOnly);
+        let l3 = render_describe(g, GuideLevel::Detailed);
         assert!(l1.contains("int open("));
         assert!(!l1.contains("openat が便利"));
         assert!(l3.contains("openat(AT_FDCWD"));

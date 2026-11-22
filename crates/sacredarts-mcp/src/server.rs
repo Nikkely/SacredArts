@@ -278,7 +278,7 @@ impl SacredArts {
             "related": guide.related,
             "man_pages": guide.man_pages,
         });
-        if g >= GuideLevel::Level3 {
+        if g >= GuideLevel::Detailed {
             v["guide"] = serde_json::to_value(guide).unwrap_or_default();
         }
         Ok(ok(text, v))
