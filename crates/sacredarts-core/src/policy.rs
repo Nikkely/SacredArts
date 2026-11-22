@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use strum::VariantNames;
 
 /// errno returned by the kernel when a denied syscall is attempted, by name
-/// (`EPERM`, `ENOSYS`, `EIO`, ...). Any errno the C library inside the sandbox
-/// knows is accepted; the name is resolved to its number there, so an unknown
-/// name makes `policy_set` fail and the previous policy stays active.
+/// (`EPERM`, `ENOSYS`, `EIO`, ...). The name is not checked here: only the C
+/// library inside the sandbox knows which names exist, so it is resolved there
+/// and an unknown name is reported as `invalid_policy` (nothing changes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DenyErrno(String);
@@ -20,24 +20,12 @@ impl Default for DenyErrno {
 }
 
 impl DenyErrno {
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn new(name: &str) -> Self {
+        DenyErrno(name.trim().to_string())
     }
 
-    /// Lexical check only (`E` followed by upper-case letters / digits).
-    pub fn parse(s: &str) -> Result<Self, ValidationError> {
-        let t = s.trim();
-        let ok =
-            t.len() > 1 && t.starts_with('E') && t[1..].bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
-        if ok {
-            Ok(DenyErrno(t.to_string()))
-        } else {
-            Err(ValidationError::new(
-                "invalid_errno",
-                format!("{s:?} is not an errno name (expected something like EPERM, ENOSYS, EIO)"),
-            )
-            .field("errno"))
-        }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -70,10 +58,7 @@ impl Policy {
         }
         out.sort();
         out.dedup();
-        let errno = match errno {
-            Some(e) => DenyErrno::parse(e)?,
-            None => DenyErrno::default(),
-        };
+        let errno = errno.map(DenyErrno::new).unwrap_or_default();
         Ok(Policy { deny: out, errno })
     }
 
@@ -96,11 +81,10 @@ mod tests {
         assert_eq!(p.deny, vec![SyscallName::Getpid, SyscallName::Mkdirat]);
         assert_eq!(p.errno.as_str(), "EPERM");
         assert!(Policy::from_user(&["sendto".into()], None).is_err());
-        for e in ["EBADF", "EIO", "ENOSYS", "E2BIG"] {
+        // errno names are passed through; the sandbox resolves them
+        for e in ["EBADF", "EIO", "E2BIG", "ENOTANERRNO"] {
             assert_eq!(Policy::from_user(&[], Some(e)).unwrap().errno.as_str(), e);
         }
-        assert!(Policy::from_user(&[], Some("eperm")).is_err());
-        assert!(Policy::from_user(&[], Some("E")).is_err());
         assert_eq!(serde_json::to_string(&DenyErrno::default()).unwrap(), "\"EPERM\"");
     }
 }

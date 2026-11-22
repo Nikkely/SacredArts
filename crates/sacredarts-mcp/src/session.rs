@@ -205,7 +205,11 @@ impl Manager {
             .await?;
             match conn.recv(self.cfg.startup_timeout).await? {
                 SupervisorMessage::Ready { runner } => Ok(runner),
-                SupervisorMessage::InitFailed { message } => Err(ToolError::infra(
+                SupervisorMessage::InitFailed {
+                    message,
+                    kind: Some(SupervisorErrorKind::InvalidPolicy),
+                } => Err(ToolError::new(ErrorKind::InvalidArgument, "invalid_policy", message)),
+                SupervisorMessage::InitFailed { message, .. } => Err(ToolError::infra(
                     "runner_start_failed",
                     format!("the sandbox could not start the runner: {message}"),
                 )),
@@ -347,6 +351,7 @@ impl Manager {
         let (ek, code) = match kind {
             SupervisorErrorKind::RunnerTimeout => (ErrorKind::Timeout, "syscall_timeout"),
             SupervisorErrorKind::RunnerCrashed => (ErrorKind::Infrastructure, "runner_crashed"),
+            SupervisorErrorKind::InvalidPolicy => (ErrorKind::InvalidArgument, "invalid_policy"),
             SupervisorErrorKind::PolicyApplyFailed => (ErrorKind::Infrastructure, "policy_apply_failed"),
             SupervisorErrorKind::RunnerUnavailable => (ErrorKind::Infrastructure, "runner_unavailable"),
             SupervisorErrorKind::Internal => (ErrorKind::Infrastructure, "internal"),

@@ -251,6 +251,9 @@ pub enum SupervisorErrorKind {
     RunnerTimeout,
     /// The runner died unexpectedly; it was recreated.
     RunnerCrashed,
+    /// The policy cannot be turned into a seccomp filter (e.g. an errno name
+    /// the C library does not know). Nothing was changed.
+    InvalidPolicy,
     /// The new runner could not be started; the old one is still active.
     PolicyApplyFailed,
     /// The runner could not be (re)started at all.
@@ -266,6 +269,9 @@ pub enum SupervisorMessage {
     },
     InitFailed {
         message: String,
+        /// Set when the failure was caused by the requested policy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<SupervisorErrorKind>,
     },
     Invoked {
         id: u64,

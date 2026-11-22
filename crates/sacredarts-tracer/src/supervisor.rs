@@ -418,9 +418,6 @@ impl Supervisor {
     }
 
     fn spawn_runner(&mut self, policy: &Policy) -> Result<RunnerProc, String> {
-        // Reject a policy the kernel filter cannot be built from (e.g. an
-        // unknown errno name) before touching the current runner or strace.
-        sacredarts_policy::compile(policy)?;
         self.generation += 1;
         let generation = self.generation;
         if self.cfg.strace_bin.is_some() && self.strace_failure.is_none() {
@@ -478,6 +475,13 @@ impl Supervisor {
                 if self.runner.is_some() {
                     return Some(SupervisorMessage::InitFailed {
                         message: "already initialised".into(),
+                        kind: None,
+                    });
+                }
+                if let Err(e) = sacredarts_policy::compile(&policy) {
+                    return Some(SupervisorMessage::InitFailed {
+                        message: e,
+                        kind: Some(SupervisorErrorKind::InvalidPolicy),
                     });
                 }
                 match self.spawn_runner(&policy) {
@@ -486,7 +490,7 @@ impl Supervisor {
                         self.runner = Some(p);
                         SupervisorMessage::Ready { runner }
                     }
-                    Err(e) => SupervisorMessage::InitFailed { message: e },
+                    Err(e) => SupervisorMessage::InitFailed { message: e, kind: None },
                 }
             }
             HostMessage::Invoke { id, request } => {
@@ -554,6 +558,16 @@ impl Supervisor {
                 }
             }
             HostMessage::SetPolicy { id, policy } => {
+                // Check the policy before touching the current runner or strace.
+                if let Err(e) = sacredarts_policy::compile(&policy) {
+                    return Some(SupervisorMessage::Error {
+                        id,
+                        kind: SupervisorErrorKind::InvalidPolicy,
+                        message: e,
+                        state_reset: false,
+                        runner: self.runner.as_ref().map(|r| r.info.clone()),
+                    });
+                }
                 // Start the new runner first; only switch when it is healthy.
                 match self.spawn_runner(&policy) {
                     Ok(mut new) => match new.request(RunnerOp::Ping, timeout) {

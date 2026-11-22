@@ -449,11 +449,13 @@ fn t07_seccomp() {
     .ok();
     let g = m.invoke(&sid, "getpid", json!({})).ok();
     assert_eq!(g.v["errno"]["name"], "EIO");
-    let e = m.tool(
-        "policy_set",
-        json!({"session_id": sid, "deny": ["getpid"], "errno": "ENOTANERRNO"}),
-    );
-    assert!(e.is_error, "{}", e.text);
+    let e = m
+        .tool(
+            "policy_set",
+            json!({"session_id": sid, "deny": ["getpid"], "errno": "ENOTANERRNO"}),
+        )
+        .err("invalid_policy");
+    assert_eq!(e.v["error"]["kind"], "invalid_argument");
     let g = m.invoke(&sid, "getpid", json!({})).ok();
     assert_eq!(g.v["errno"]["name"], "EIO", "previous policy still active");
     m.tool("sandbox_destroy", json!({"session_id": sid})).ok();
@@ -481,6 +483,11 @@ fn t08_errors() {
     m.invoke(&sid, "read", json!({"fd": 3})).err("missing_argument");
     m.tool("sandbox_create", json!({"guide_level": 7}))
         .err("invalid_guide_level");
+    m.tool(
+        "sandbox_create",
+        json!({"policy": {"deny": ["getpid"], "errno": "ENOPE"}}),
+    )
+    .err("invalid_policy");
     // unsupported syscall
     let e = m.invoke(&sid, "execve", json!({})).err("unsupported_syscall");
     assert_eq!(e.v["error"]["kind"], "unsupported_syscall");

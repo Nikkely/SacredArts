@@ -117,14 +117,14 @@ mod linux {
 
         #[test]
         fn any_errno_name_resolves() {
-            let v = |s: &str| errno_value(&DenyErrno::parse(s).unwrap());
+            let v = |s: &str| errno_value(&DenyErrno::new(s));
             assert_eq!(v("EPERM").unwrap(), libc::EPERM as u32);
             assert_eq!(v("EIO").unwrap(), libc::EIO as u32);
             assert_eq!(v("EHWPOISON").unwrap(), libc::EHWPOISON as u32);
             assert!(v("ENOTANERRNO").is_err());
             let bad = Policy {
                 deny: vec![SyscallName::Getpid],
-                errno: DenyErrno::parse("ENOTANERRNO").unwrap(),
+                errno: DenyErrno::new("ENOTANERRNO"),
             };
             assert!(compile(&bad).is_err());
         }

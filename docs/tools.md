@@ -12,7 +12,7 @@
 
 | `error.kind` | 意味 | 主な `code` |
 |---|---|---|
-| `invalid_argument` | 入力検証で拒否（syscall 未発行） | `invalid_path` `invalid_flags` `invalid_mode` `missing_argument` `unknown_argument` `reserved_fd` `invalid_errno` `invalid_guide_level` |
+| `invalid_argument` | 入力検証で拒否（syscall 未発行） | `invalid_path` `invalid_flags` `invalid_mode` `missing_argument` `unknown_argument` `reserved_fd` `invalid_policy` `invalid_guide_level` |
 | `unsupported_syscall` | 未対応の syscall 名 | `unsupported_syscall` `unknown_syscall` |
 | `session_not_found` | セッションが存在しない | `session_not_found` |
 | `limit_exceeded` | 上限超過 | `too_many_sessions` `limit_exceeded` |
@@ -183,7 +183,7 @@ Level 1: 概要とシグネチャ / Level 2: ＋説明・補足（`open` と `op
 入力: `{ "session_id": "uuid", "deny": ["mkdirat"], "errno": "EPERM" }`
 
 - `deny` は対応 6 syscall の部分集合のみ（それ以外は `unsupported_syscall`）。空配列で制限解除。
-- `errno`: Linux の errno 名なら何でも（既定 `EPERM`。`ENOSYS`、`EIO` など）。名前から番号への変換はサンドボックス内の glibc（`strerrorname_np`）で行い、知らない名前なら `policy_apply_failed` で失敗して元のポリシーが残ります。
+- `errno`: Linux の errno 名なら何でも（既定 `EPERM`。`ENOSYS`、`EIO` など）。名前から番号への変換はサンドボックス内の glibc（`strerrorname_np`）で行い、知らない名前なら `invalid_policy`（入力の誤り）で失敗し、元のポリシーが残ります（ホスト側では名前の形を推測で検査しません）。
 - Runner を新しい seccomp フィルタ付きで再作成します。**開いていた fd は失われます**（`state_reset: true`）。
 
 出力（抜粋）:
