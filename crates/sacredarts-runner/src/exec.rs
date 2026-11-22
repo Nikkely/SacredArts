@@ -21,6 +21,7 @@ use sacredarts_core::{Dirfd, OpenFlag, SyscallRequest, ValidationError};
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
+use strum::IntoEnumIterator;
 
 pub struct Runner {
     /// Working directory of the runner; relative paths with `AT_FDCWD`
@@ -87,27 +88,11 @@ pub fn decode_flags(bits: libc::c_int) -> String {
         m => format!("{m:#x}"),
     }];
     let mut rest = bits & !libc::O_ACCMODE;
-    // Aliases (O_NDELAY, O_RSYNC) are left out; O_SYNC/O_TMPFILE contain other bits.
-    let order = [
-        OpenFlag::O_TMPFILE,
-        OpenFlag::O_SYNC,
-        OpenFlag::O_CREAT,
-        OpenFlag::O_EXCL,
-        OpenFlag::O_NOCTTY,
-        OpenFlag::O_TRUNC,
-        OpenFlag::O_APPEND,
-        OpenFlag::O_NONBLOCK,
-        OpenFlag::O_DSYNC,
-        OpenFlag::O_ASYNC,
-        OpenFlag::O_DIRECT,
-        OpenFlag::O_LARGEFILE,
-        OpenFlag::O_DIRECTORY,
-        OpenFlag::O_NOFOLLOW,
-        OpenFlag::O_NOATIME,
-        OpenFlag::O_CLOEXEC,
-        OpenFlag::O_PATH,
-    ];
-    for f in order {
+    // Multi-bit flags (O_TMPFILE, O_SYNC) first; an alias (O_NDELAY, O_RSYNC)
+    // never matches because its canonical name comes first and clears the bits.
+    let mut named: Vec<OpenFlag> = OpenFlag::iter().filter(|f| !f.is_access_mode()).collect();
+    named.sort_by_key(|f| std::cmp::Reverse(flag_bits(*f).count_ones()));
+    for f in named {
         let v = flag_bits(f);
         if v != 0 && rest & v == v {
             parts.push(f.as_str().to_string());
@@ -386,5 +371,26 @@ impl Runner {
             r,
         );
         Ok(Self::completed(r, std::mem::take(issued)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_like_strace() {
+        assert_eq!(
+            decode_flags(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC),
+            "O_WRONLY|O_CREAT|O_TRUNC"
+        );
+        // multi-bit flags are named once, not as their parts
+        assert_eq!(decode_flags(libc::O_RDWR | libc::O_TMPFILE), "O_RDWR|O_TMPFILE");
+        assert_eq!(decode_flags(libc::O_WRONLY | libc::O_SYNC), "O_WRONLY|O_SYNC");
+        assert_eq!(decode_flags(libc::O_DSYNC), "O_RDONLY|O_DSYNC");
+        // aliases use the canonical name
+        assert_eq!(decode_flags(libc::O_NDELAY), "O_RDONLY|O_NONBLOCK");
+        // access mode 3 and unnamed bits in hex
+        assert_eq!(decode_flags(3 | 0x4000_0000), "0x3|0x40000000");
     }
 }

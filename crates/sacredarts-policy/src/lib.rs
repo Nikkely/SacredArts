@@ -105,7 +105,7 @@ mod linux {
         #[test]
         fn compiles_for_each_syscall() {
             assert!(compile(&Policy::default()).unwrap().is_none());
-            for n in SyscallName::ALL {
+            for n in <SyscallName as strum::IntoEnumIterator>::iter() {
                 let p = Policy {
                     deny: vec![n],
                     errno: DenyErrno::default(),

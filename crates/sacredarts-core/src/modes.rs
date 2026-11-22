@@ -2,35 +2,33 @@
 //! events are shown. They are deliberately independent.
 
 use serde::{Deserialize, Serialize};
+use strum::{EnumIter, FromRepr, IntoEnumIterator};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+/// The number is the external `guide_level` value (1-3); variants are
+/// ordered from least to most detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, FromRepr, EnumIter)]
 #[serde(try_from = "u8", into = "u8")]
+#[repr(u8)]
 pub enum GuideLevel {
     #[default]
-    LineOnly,
-    Explained,
-    Detailed,
+    LineOnly = 1,
+    Explained = 2,
+    Detailed = 3,
 }
 
 impl GuideLevel {
     pub fn as_u8(self) -> u8 {
-        match self {
-            GuideLevel::LineOnly => 1,
-            GuideLevel::Explained => 2,
-            GuideLevel::Detailed => 3,
-        }
+        self as u8
     }
 }
 
 impl TryFrom<u8> for GuideLevel {
     type Error = String;
     fn try_from(v: u8) -> Result<Self, String> {
-        match v {
-            1 => Ok(GuideLevel::LineOnly),
-            2 => Ok(GuideLevel::Explained),
-            3 => Ok(GuideLevel::Detailed),
-            _ => Err(format!("guide_level must be 1, 2 or 3 (got {v})")),
-        }
+        Self::from_repr(v).ok_or_else(|| {
+            let valid: Vec<String> = Self::iter().map(|g| g.as_u8().to_string()).collect();
+            format!("guide_level must be one of {} (got {v})", valid.join(", "))
+        })
     }
 }
 
@@ -48,4 +46,21 @@ pub enum TraceMode {
     Requested,
     /// Also show every syscall strace observed for the request.
     All,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guide_level_numbers() {
+        assert_eq!(GuideLevel::default().as_u8(), 1);
+        assert_eq!(GuideLevel::try_from(3), Ok(GuideLevel::Detailed));
+        assert_eq!(
+            GuideLevel::try_from(7).unwrap_err(),
+            "guide_level must be one of 1, 2, 3 (got 7)"
+        );
+        assert_eq!(serde_json::to_string(&GuideLevel::Explained).unwrap(), "2");
+        assert!(GuideLevel::LineOnly < GuideLevel::Detailed);
+    }
 }

@@ -9,6 +9,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fmt;
+use strum::{EnumIter, EnumString, IntoEnumIterator, IntoStaticStr, VariantNames};
 
 /// Application-level validation failure. No syscall was issued.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,12 +54,15 @@ pub enum Dirfd {
     Fd(i32),
 }
 
-/// Every `open(2)` flag name Linux defines. Numeric values are architecture
-/// dependent (e.g. `O_DIRECTORY` differs between x86_64 and aarch64), so the
-/// conversion happens in the runner using the target's libc constants.
-/// Bits without a name can be passed as numbers (see `raw_flags`).
+/// Every `open(2)` flag name Linux defines, in canonical display order.
+/// Numeric values are architecture dependent (e.g. `O_DIRECTORY` differs
+/// between x86_64 and aarch64), so the conversion happens in the runner using
+/// the target's libc constants. Bits without a name can be passed as numbers
+/// (see `raw_flags`).
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, EnumIter, EnumString, IntoStaticStr, VariantNames,
+)]
 pub enum OpenFlag {
     O_RDONLY,
     O_WRONLY,
@@ -85,60 +89,8 @@ pub enum OpenFlag {
 }
 
 impl OpenFlag {
-    pub const ALL: [OpenFlag; 22] = [
-        OpenFlag::O_RDONLY,
-        OpenFlag::O_WRONLY,
-        OpenFlag::O_RDWR,
-        OpenFlag::O_CREAT,
-        OpenFlag::O_EXCL,
-        OpenFlag::O_NOCTTY,
-        OpenFlag::O_TRUNC,
-        OpenFlag::O_APPEND,
-        OpenFlag::O_NONBLOCK,
-        OpenFlag::O_NDELAY,
-        OpenFlag::O_DSYNC,
-        OpenFlag::O_SYNC,
-        OpenFlag::O_RSYNC,
-        OpenFlag::O_ASYNC,
-        OpenFlag::O_DIRECT,
-        OpenFlag::O_LARGEFILE,
-        OpenFlag::O_DIRECTORY,
-        OpenFlag::O_NOFOLLOW,
-        OpenFlag::O_NOATIME,
-        OpenFlag::O_CLOEXEC,
-        OpenFlag::O_PATH,
-        OpenFlag::O_TMPFILE,
-    ];
-
     pub fn as_str(self) -> &'static str {
-        match self {
-            OpenFlag::O_RDONLY => "O_RDONLY",
-            OpenFlag::O_WRONLY => "O_WRONLY",
-            OpenFlag::O_RDWR => "O_RDWR",
-            OpenFlag::O_CREAT => "O_CREAT",
-            OpenFlag::O_EXCL => "O_EXCL",
-            OpenFlag::O_NOCTTY => "O_NOCTTY",
-            OpenFlag::O_TRUNC => "O_TRUNC",
-            OpenFlag::O_APPEND => "O_APPEND",
-            OpenFlag::O_NONBLOCK => "O_NONBLOCK",
-            OpenFlag::O_NDELAY => "O_NDELAY",
-            OpenFlag::O_DSYNC => "O_DSYNC",
-            OpenFlag::O_SYNC => "O_SYNC",
-            OpenFlag::O_RSYNC => "O_RSYNC",
-            OpenFlag::O_ASYNC => "O_ASYNC",
-            OpenFlag::O_DIRECT => "O_DIRECT",
-            OpenFlag::O_LARGEFILE => "O_LARGEFILE",
-            OpenFlag::O_DIRECTORY => "O_DIRECTORY",
-            OpenFlag::O_NOFOLLOW => "O_NOFOLLOW",
-            OpenFlag::O_NOATIME => "O_NOATIME",
-            OpenFlag::O_CLOEXEC => "O_CLOEXEC",
-            OpenFlag::O_PATH => "O_PATH",
-            OpenFlag::O_TMPFILE => "O_TMPFILE",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|f| f.as_str() == s)
+        self.into()
     }
 
     pub fn is_access_mode(self) -> bool {
@@ -206,12 +158,12 @@ impl SyscallRequest {
 
     /// Parse untrusted arguments for the syscall `name`.
     pub fn from_user(name: &str, args: &Value) -> Result<Self, ValidationError> {
-        let Some(sys) = SyscallName::parse(name) else {
+        let Ok(sys) = name.parse::<SyscallName>() else {
             return Err(ValidationError::new(
                 "unsupported_syscall",
                 format!(
                     "{name:?} is not supported. Supported syscalls: {}",
-                    SyscallName::names().join(", ")
+                    SyscallName::VARIANTS.join(", ")
                 ),
             )
             .field("name"));
@@ -420,7 +372,7 @@ fn flag_token(t: &str, names: &mut Vec<OpenFlag>, raw: &mut u32) -> Result<(), V
     if t.is_empty() {
         return Ok(());
     }
-    if let Some(f) = OpenFlag::parse(t) {
+    if let Ok(f) = t.parse::<OpenFlag>() {
         if !names.contains(&f) {
             names.push(f);
         }
@@ -429,7 +381,7 @@ fn flag_token(t: &str, names: &mut Vec<OpenFlag>, raw: &mut u32) -> Result<(), V
     let n = parse_c_int(t).and_then(|n| u32::try_from(n).ok()).ok_or_else(|| {
         bad_flags(format!(
             "unknown flag {t:?}; use O_* names ({}) or numbers like 0x80000",
-            OpenFlag::ALL.map(|f| f.as_str()).join(" ")
+            OpenFlag::VARIANTS.join(" ")
         ))
     })?;
     *raw |= n;
@@ -472,7 +424,7 @@ fn parse_flags(v: Option<&Value>) -> Result<(Vec<OpenFlag>, u32), ValidationErro
     if !names.iter().any(|f| f.is_access_mode()) && raw & O_ACCMODE == 0 {
         names.push(OpenFlag::O_RDONLY);
     }
-    let out = OpenFlag::ALL.into_iter().filter(|f| names.contains(f)).collect();
+    let out = OpenFlag::iter().filter(|f| names.contains(f)).collect();
     Ok((out, raw))
 }
 

@@ -594,7 +594,7 @@ impl ServerHandler for SacredArts {
                  guide_level 1-3 controls explanation detail; trace_mode requested|all controls whether strace-observed kernel syscalls are shown.\n\
                  policy_set installs a kernel seccomp filter (runner is recreated, open fds are lost).",
                 self.mgr.cfg.activation.instructions(),
-                SyscallName::names().join(", ")
+                <SyscallName as strum::VariantNames>::VARIANTS.join(", ")
             ))
     }
 }

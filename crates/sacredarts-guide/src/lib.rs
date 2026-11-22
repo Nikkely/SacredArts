@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn all_builtin_guides_parse_and_cover_syscalls() {
         let g = Guides::parse_builtin().unwrap();
-        for n in SyscallName::ALL {
+        for n in <SyscallName as strum::IntoEnumIterator>::iter() {
             let x = g.get(n.as_str()).unwrap_or_else(|| panic!("missing guide {n}"));
             assert!(x.executable);
             assert!(!x.explain.success.is_empty() && !x.explain.failure.is_empty());

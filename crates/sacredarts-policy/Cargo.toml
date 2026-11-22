@@ -11,3 +11,6 @@ sacredarts-core.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 seccompiler = "0.5"
+
+[dev-dependencies]
+strum.workspace = true

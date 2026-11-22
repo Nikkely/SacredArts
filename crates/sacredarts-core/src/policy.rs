@@ -3,6 +3,7 @@
 use crate::request::ValidationError;
 use crate::syscall::SyscallName;
 use serde::{Deserialize, Serialize};
+use strum::VariantNames;
 
 /// errno returned by the kernel when a denied syscall is attempted, by name
 /// (`EPERM`, `ENOSYS`, `EIO`, ...). Any errno the C library inside the sandbox
@@ -55,12 +56,12 @@ impl Policy {
     pub fn from_user(deny: &[String], errno: Option<&str>) -> Result<Self, ValidationError> {
         let mut out = Vec::new();
         for name in deny {
-            let n = SyscallName::parse(name).ok_or_else(|| {
+            let n = name.parse::<SyscallName>().map_err(|_| {
                 ValidationError::new(
                     "unsupported_syscall",
                     format!(
                         "cannot deny {name:?}: policies may only list the MVP learning syscalls ({})",
-                        SyscallName::names().join(", ")
+                        SyscallName::VARIANTS.join(", ")
                     ),
                 )
                 .field("deny")
