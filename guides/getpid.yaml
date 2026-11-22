@@ -1,0 +1,50 @@
+name: getpid
+executable: true
+category: process
+summary: 呼び出したプロセスのプロセスID（PID）を取得する
+description: |
+  getpid は、いま実行中のプロセス自身のプロセスID（PID）を返すシステムコールです。
+  引数はなく、失敗することもありません。
+purpose: |
+  カーネルはプロセスごとに番号（PID）を割り当てて管理しています。getpid はその番号を
+  プロセス自身が知るための最も単純なシステムコールで、システムコールの仕組みを学ぶ最初の一歩に向いています。
+signature: |
+  #include <unistd.h>
+
+  pid_t getpid(void);
+arguments: []
+return_value: |
+  呼び出したプロセスの PID。常に成功し、エラーを返しません（man getpid(2): "These functions are always successful."）。
+errors:
+  - name: EPERM
+    description: 通常は起こりません。SacredArts では seccomp ポリシーで getpid を deny したときにカーネルが返します。
+flags: []
+concepts:
+  - name: プロセスID（PID）
+    description: カーネルがプロセス（正確にはスレッドグループ）を識別する番号です。
+  - name: PID 名前空間（PID namespace）
+    description: |
+      コンテナでは PID 名前空間が分離されており、getpid が返すのは「その名前空間の中での番号」です。
+      ホスト側から見た同じプロセスの PID とは一般に異なります。
+  - name: スレッドグループと TID
+    description: |
+      Linux ではスレッドもタスクとして管理されます。getpid が返すのはスレッドグループID（TGID）で、
+      個々のスレッドの ID は gettid で取得します。
+state_changes:
+  - 状態は変化しません（読み取りのみ）。
+related:
+  - getppid
+  - gettid
+man_pages:
+  - getpid(2)
+  - pid_namespaces(7)
+explain:
+  success: |
+    戻り値 `{ret}` が、syscall を実行した SacredArts Runner プロセスの PID です。
+    これはコンテナの PID 名前空間内での番号です。
+  failure: |
+    getpid は通常失敗しません。今回は `{errno}`（{errno_message}）が返りました。
+notes:
+  - |
+    glibc 2.25 より前は getpid の結果をキャッシュしていましたが、現在はキャッシュせず毎回システムコールを発行します。
+    SacredArts は libc を介さず syscall(SYS_getpid) を直接呼びます。

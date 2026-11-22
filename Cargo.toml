@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sacredarts-core",
+    "crates/sacredarts-policy",
+    "crates/sacredarts-runner",
+    "crates/sacredarts-tracer",
+    "crates/sacredarts-guide",
+    "crates/sacredarts-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+sacredarts-core = { path = "crates/sacredarts-core" }
+sacredarts-policy = { path = "crates/sacredarts-policy" }
+sacredarts-guide = { path = "crates/sacredarts-guide" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

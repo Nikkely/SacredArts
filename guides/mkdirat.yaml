@@ -1,0 +1,70 @@
+name: mkdirat
+executable: true
+category: filesystem
+summary: ディレクトリを作成する
+description: |
+  mkdirat は新しいディレクトリを作るシステムコールです。成功すると 0 を返します。
+  dirfd を基準に相対パスを解決できる点が mkdir との違いです。
+purpose: |
+  親ディレクトリに新しいエントリを追加し、空のディレクトリ（"." と ".." だけを含む）を作ります。
+signature: |
+  #include <fcntl.h>
+  #include <sys/stat.h>
+
+  int mkdirat(int dirfd, const char *pathname, mode_t mode);
+arguments:
+  - name: dirfd
+    type: int
+    description: 相対パスの基準ディレクトリの fd。AT_FDCWD ならカレントディレクトリ。
+  - name: pathname
+    type: const char *
+    description: 作成するディレクトリのパス。
+  - name: mode
+    type: mode_t
+    description: 新しいディレクトリのパーミッション。実際の値は mode & ~umask & 0777（など）になる。
+return_value: |
+  成功すると 0。失敗すると -1（errno を設定）。
+errors:
+  - name: EEXIST
+    description: 同じ名前のファイル・ディレクトリ・シンボリックリンクがすでにある。
+  - name: ENOENT
+    description: 親ディレクトリが存在しない。
+  - name: ENOTDIR
+    description: パスの途中がディレクトリではない、または dirfd がディレクトリではない。
+  - name: EACCES
+    description: 親ディレクトリへの書き込み権限がない。
+  - name: ENOSPC
+    description: 空き容量がない。
+  - name: EROFS
+    description: 読み取り専用ファイルシステム上に作ろうとした（SacredArts のコンテナではルート FS が読み取り専用で、書き込めるのは /workspace と /tmp だけです）。
+  - name: EPERM
+    description: ファイルシステムがディレクトリ作成をサポートしていない場合など。SacredArts では seccomp ポリシーで mkdirat を deny したときにカーネルが返します。
+flags: []
+concepts:
+  - name: ディレクトリエントリと inode
+    description: ディレクトリは「名前 → inode」の対応表です。mkdirat は新しい inode を作り、親ディレクトリにその名前のエントリを追加します。
+  - name: umask
+    description: 新規作成時の権限からプロセスの umask のビットが取り除かれます（例 0755 & ~022 = 0755、0777 & ~022 = 0755）。
+  - name: リンク数
+    description: 新しいディレクトリ内の ".." が親を指すため、親ディレクトリのリンク数が 1 増えます（一般的なファイルシステムの場合）。
+  - name: seccomp
+    description: |
+      seccomp-BPF はプロセスが発行するシステムコールをカーネル内のフィルタで検査する仕組みです。
+      SacredArts の policy_set で mkdirat を deny すると、フィルタがシステムコール番号を見て errno を返し、mkdirat 本体は実行されません。
+state_changes:
+  - 親ディレクトリに新しいエントリ（ディレクトリ）が追加される。
+related:
+  - openat
+  - close
+man_pages:
+  - mkdirat(2)
+  - mkdir(2)
+  - seccomp(2)
+explain:
+  success: |
+    `{path}` というディレクトリをパーミッション {mode}（実際は umask が適用されます）で作成しました。
+  failure: |
+    `{path}` を作成できませんでした。エラーは `{errno}`（{errno_message}）です。
+notes:
+  - |
+    x86_64 には mkdir システムコールもありますが、aarch64 には mkdirat しかありません。SacredArts はどちらでも mkdirat を直接発行します。

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "sacredarts": {
+      "command": "/absolute/path/to/sacredarts/target/release/sacredarts",
+      "env": {
+        "SACREDARTS_LOG": "info",
+        "SACREDARTS_MAX_SESSIONS": "4",
+        "SACREDARTS_REQUEST_TIMEOUT_MS": "5000"
+      }
+    }
+  }
+}

@@ -1,0 +1,58 @@
+name: close
+executable: true
+category: filesystem
+summary: ファイルディスクリプタを閉じる
+description: |
+  close は、使い終わったファイルディスクリプタ（fd）を閉じてプロセスの fd テーブルから取り除くシステムコールです。
+  閉じた番号は、次に open/openat したときに再利用されることがあります。
+purpose: |
+  fd はプロセスごとに数が限られた資源です。close によって fd テーブルの枠を解放し、
+  そのファイルを参照する「オープンファイル記述（open file description）」の参照も 1 つ減らします。
+signature: |
+  #include <unistd.h>
+
+  int close(int fd);
+arguments:
+  - name: fd
+    type: int
+    description: 閉じるファイルディスクリプタ。
+return_value: |
+  成功すると 0。失敗すると -1 を返し、errno が設定されます。
+errors:
+  - name: EBADF
+    description: fd が開いていない（すでに閉じた、または最初から存在しない）。
+  - name: EINTR
+    description: シグナルで中断された。Linux では fd はそれでも解放されるため、close を再試行してはいけません。
+  - name: EIO
+    description: I/O エラー。遅延していた書き込みの失敗が close で報告されることがあります。
+  - name: EPERM
+    description: SacredArts では seccomp ポリシーで close を deny したときにカーネルが返します（この場合 fd は閉じられません）。
+flags: []
+concepts:
+  - name: ファイルディスクリプタテーブル（fd table）
+    description: プロセスごとの「番号 → オープンファイル記述」の対応表です。close はこの表の該当エントリを空にします。
+  - name: オープンファイル記述（open file description）
+    description: |
+      ファイルオフセットやオープン時のフラグを保持するカーネル内のオブジェクトです。
+      dup や fork で複数の fd から共有されることがあり、最後の参照が close されたときに解放されます。
+  - name: 最小番号の再利用
+    description: 新しい fd には「その時点で空いている最小の番号」が割り当てられます（POSIX の規定）。
+state_changes:
+  - fd テーブルから該当 fd が削除され、その番号が再利用可能になる。
+  - オープンファイル記述の参照カウントが 1 減る（0 になれば解放される）。
+related:
+  - openat
+  - read
+  - write
+man_pages:
+  - close(2)
+explain:
+  success: |
+    学習用ハンドル `{fd}` を閉じました（実際にはカーネル fd {real_fd} を close しています）。
+    このハンドル番号は次の openat で再利用される可能性があり、閉じた後に read/write すると失敗します。
+  failure: |
+    close が `{errno}`（{errno_message}）で失敗しました。
+notes:
+  - |
+    Linux の close は、エラーを返した場合でも fd を解放していることがあります（EINTR など）。
+    SacredArts は失敗時に fcntl(F_GETFD) でカーネルに fd がまだ存在するかを確認し、ハンドル表を実際の状態に合わせます。
