@@ -201,7 +201,7 @@ impl SacredArts {
             None => Policy::default(),
         };
         let tm: TraceMode = p.trace_mode.map(Into::into).unwrap_or_default();
-        let s = match self.mgr.create(g, tm, pol.clone()).await {
+        let s = match self.mgr.create(g, tm, pol).await {
             Ok(s) => s,
             Err(e) => return Ok(err(e)),
         };
@@ -213,7 +213,7 @@ impl SacredArts {
             "architecture": r.arch,
             "guide_level": g,
             "trace_mode": tm,
-            "policy": pol,
+            "policy": st.policy,
             "workspace": sacredarts_core::limits::WORKSPACE_ROOT,
             "container": s.container,
             "runner": { "pid": r.pid, "generation": r.generation, "pid_namespace": "container" },
@@ -227,7 +227,7 @@ impl SacredArts {
             r.arch,
             g.as_u8(),
             tm,
-            pol.deny.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+            st.policy.deny.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
             r.pid
         );
         Ok(ok(text, v))
@@ -499,6 +499,7 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
             handle_change,
             read_data_b64,
             notes,
+            open_flags,
         } => {
             let data = read_data_b64
                 .as_deref()
@@ -533,6 +534,7 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
                 observation: Some(&observation),
                 trace_mode,
                 notes,
+                open_flags: open_flags.as_ref(),
                 denied_by_policy,
             };
             let rendered = render_invocation(Guides::builtin(), guide_level, &view);

@@ -474,6 +474,17 @@ fn t07_seccomp() {
     assert_eq!(e.v["error"]["kind"], "invalid_argument");
     let g = m.invoke(&sid, "getpid", json!({})).ok();
     assert_eq!(g.v["errno"]["name"], "EIO", "previous policy still active");
+    // aliases are accepted and stored by their canonical name
+    let p = m
+        .tool(
+            "policy_set",
+            json!({"session_id": sid, "deny": ["getpid"], "errno": "EWOULDBLOCK"}),
+        )
+        .ok();
+    assert_eq!(p.v["policy"]["errno"], "EAGAIN");
+    let g = m.invoke(&sid, "getpid", json!({})).ok();
+    assert_eq!(g.v["errno"]["name"], "EAGAIN");
+    assert_eq!(g.v["denied_by_policy"], true);
     m.tool("sandbox_destroy", json!({"session_id": sid})).ok();
     m.shutdown();
 }

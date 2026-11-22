@@ -31,24 +31,57 @@ mod linux {
         }) as i64
     }
 
-    /// errno number for a name, resolved by the C library of the target
-    /// (glibc's `strerrorname_np`), so every errno it knows can be used.
-    pub fn errno_value(e: &DenyErrno) -> Result<u32, String> {
+    /// Canonical errno name for a number (glibc's `strerrorname_np`).
+    pub fn errno_name(n: i32) -> Option<String> {
         #[cfg(target_env = "gnu")]
         {
             unsafe extern "C" {
                 fn strerrorname_np(errnum: libc::c_int) -> *const libc::c_char;
             }
-            // errno values are small positive ints; 4095 is the kernel's MAX_ERRNO.
-            for n in 1..4096 {
-                // SAFETY: returns NULL or a pointer to a static NUL-terminated string.
-                let p = unsafe { strerrorname_np(n) };
-                if !p.is_null() && unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes() == e.as_str().as_bytes() {
-                    return Ok(n as u32);
-                }
+            // SAFETY: returns NULL or a pointer to a static NUL-terminated string.
+            let p = unsafe { strerrorname_np(n) };
+            if !p.is_null() {
+                return Some(unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned());
             }
         }
-        Err(format!("unknown errno name {:?}", e.as_str()))
+        #[cfg(not(target_env = "gnu"))]
+        let _ = n;
+        None
+    }
+
+    /// Names that are aliases of another errno. `strerrorname_np` only returns
+    /// the canonical name, so these cannot be found by searching its output.
+    const ERRNO_ALIASES: [(&str, i32); 3] = [
+        ("EWOULDBLOCK", libc::EWOULDBLOCK),
+        ("ENOTSUP", libc::ENOTSUP),
+        ("EDEADLOCK", libc::EDEADLOCK),
+    ];
+
+    /// errno number for a name (canonical names and their aliases).
+    pub fn errno_value(e: &DenyErrno) -> Result<u32, String> {
+        let name = e.as_str();
+        ERRNO_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == name)
+            .map(|(_, n)| *n)
+            // errno values are small positive ints; 4095 is the kernel's MAX_ERRNO.
+            .or_else(|| (1..4096).find(|n| errno_name(*n).as_deref() == Some(name)))
+            .map(|n| n as u32)
+            .ok_or_else(|| format!("unknown errno name {name:?}"))
+    }
+
+    /// The policy with its errno written by its canonical name (`EWOULDBLOCK`
+    /// becomes `EAGAIN`), which is what the kernel's errno is reported as.
+    /// Fails for a policy that cannot be compiled.
+    pub fn canonicalize(policy: &Policy) -> Result<Policy, String> {
+        let n = errno_value(&policy.errno)?;
+        let name = errno_name(n as i32).ok_or_else(|| format!("errno {n} has no name"))?;
+        let canonical = Policy {
+            deny: policy.deny.clone(),
+            errno: DenyErrno::new(&name),
+        };
+        compile(&canonical)?;
+        Ok(canonical)
     }
 
     fn target_arch() -> Result<TargetArch, String> {
@@ -122,6 +155,14 @@ mod linux {
             assert_eq!(v("EIO").unwrap(), libc::EIO as u32);
             assert_eq!(v("EHWPOISON").unwrap(), libc::EHWPOISON as u32);
             assert!(v("ENOTANERRNO").is_err());
+            // aliases resolve to the canonical errno
+            assert_eq!(v("EWOULDBLOCK").unwrap(), libc::EAGAIN as u32);
+            assert_eq!(v("ENOTSUP").unwrap(), libc::EOPNOTSUPP as u32);
+            let p = Policy {
+                deny: vec![SyscallName::Getpid],
+                errno: DenyErrno::new("EWOULDBLOCK"),
+            };
+            assert_eq!(canonicalize(&p).unwrap().errno.as_str(), "EAGAIN");
             let bad = Policy {
                 deny: vec![SyscallName::Getpid],
                 errno: DenyErrno::new("ENOTANERRNO"),
@@ -141,4 +182,4 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{apply, compile, errno_value, syscall_number};
+pub use linux::{apply, canonicalize, compile, errno_name, errno_value, syscall_number};

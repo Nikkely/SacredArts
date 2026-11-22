@@ -101,6 +101,57 @@ impl OpenFlag {
 /// `O_ACCMODE` (the access-mode bits); 3 on every Linux architecture.
 pub const O_ACCMODE: u32 = 3;
 
+/// Open flags as the kernel received them, decoded like strace: the access
+/// mode, the named bits, and any bits without a name. Produced by the runner
+/// (the values are architecture specific).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodedFlags {
+    /// `flags & O_ACCMODE`: 0 = O_RDONLY, 1 = O_WRONLY, 2 = O_RDWR, 3 = neither.
+    pub access_mode: u32,
+    /// Named flags other than the access mode (aliases use the canonical name).
+    pub named: Vec<OpenFlag>,
+    /// Bits with no name, shown in hex.
+    pub unnamed: u32,
+}
+
+impl DecodedFlags {
+    pub fn contains(&self, f: OpenFlag) -> bool {
+        self.named.contains(&f)
+    }
+
+    /// Best effort without the target's flag values (used only when the
+    /// runner did not report its decoding): numeric bits stay unnamed.
+    pub fn from_request(flags: &[OpenFlag], raw: u32) -> Self {
+        let access_mode = flags.iter().fold(raw & O_ACCMODE, |a, f| match f {
+            OpenFlag::O_WRONLY => a | 1,
+            OpenFlag::O_RDWR => a | 2,
+            _ => a,
+        });
+        DecodedFlags {
+            access_mode,
+            named: flags.iter().copied().filter(|f| !f.is_access_mode()).collect(),
+            unnamed: raw & !O_ACCMODE,
+        }
+    }
+}
+
+impl fmt::Display for DecodedFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let access = match self.access_mode {
+            0 => "O_RDONLY".to_string(),
+            1 => "O_WRONLY".to_string(),
+            2 => "O_RDWR".to_string(),
+            m => format!("{m:#x}"),
+        };
+        let unnamed = (self.unnamed != 0).then(|| format!("{:#x}", self.unnamed));
+        let parts: Vec<String> = std::iter::once(access)
+            .chain(self.named.iter().map(|n| n.as_str().to_string()))
+            .chain(unnamed)
+            .collect();
+        f.write_str(&parts.join("|"))
+    }
+}
+
 /// A parsed syscall request. Arguments are passed to the kernel as given;
 /// only what cannot be marshalled (NUL in a path, oversized buffers, a
 /// `count` larger than the supplied data) is rejected here.

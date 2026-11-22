@@ -84,7 +84,7 @@ impl Rn {
     fn call(&mut self, name: &str, args: Value) -> InvokeOutcome {
         let request = SyscallRequest::from_user(name, &args).expect("valid request");
         match self.op(RunnerOp::Invoke { request }) {
-            RunnerReplyBody::Invoked { outcome } => outcome,
+            RunnerReplyBody::Invoked { outcome } => *outcome,
             other => panic!("unexpected {other:?}"),
         }
     }

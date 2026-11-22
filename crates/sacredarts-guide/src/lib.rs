@@ -7,7 +7,7 @@
 
 use sacredarts_core::format::{DISPLAY_BYTES, format_dirfd, format_flags, format_mode, quote_bytes, quote_str};
 use sacredarts_core::ipc::{ErrnoInfo, HandleInfo, IssuedCall, IssuedPurpose, Observation, ObservationStatus};
-use sacredarts_core::{GuideLevel, OpenFlag, SyscallRequest, TraceMode};
+use sacredarts_core::{DecodedFlags, GuideLevel, OpenFlag, SyscallRequest, TraceMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -120,6 +120,8 @@ pub struct InvocationView<'a> {
     pub observation: Option<&'a Observation>,
     pub trace_mode: TraceMode,
     pub notes: &'a [String],
+    /// openat: flags as the kernel received them (decoded in the sandbox).
+    pub open_flags: Option<&'a DecodedFlags>,
     /// The session policy denies this syscall (so an errno equal to the
     /// policy errno comes from the seccomp filter).
     pub denied_by_policy: bool,
@@ -136,26 +138,19 @@ pub struct Rendered {
     pub text: String,
 }
 
-fn access_ja(flags: &[OpenFlag], raw: u32) -> String {
-    // O_RDONLY=0, O_WRONLY=1, O_RDWR=2 on every Linux architecture.
-    let acc = flags
-        .iter()
-        .fold(raw & sacredarts_core::request::O_ACCMODE, |a, f| match f {
-            OpenFlag::O_WRONLY => a | 1,
-            OpenFlag::O_RDWR => a | 2,
-            _ => a,
-        });
-    let mode = if flags.contains(&OpenFlag::O_PATH) {
+/// Describes what the kernel actually received (numeric bits included).
+fn access_ja(flags: &DecodedFlags) -> String {
+    let mode = if flags.contains(OpenFlag::O_PATH) {
         "読み書きはできず、場所だけを指す（O_PATH）fd として利用できる"
     } else {
-        match acc {
+        match flags.access_mode {
             2 => "読み書き両用で利用できる",
             1 => "書き込み専用で利用できる",
             3 => "アクセスモード 3 で（読み書きの権限は検査されるが、read も write もできない）利用できる",
             _ => "読み込み専用で利用できる",
         }
     };
-    let has = |f| flags.contains(&f);
+    let has = |f| flags.contains(f);
     let open = match (has(OpenFlag::O_CREAT), has(OpenFlag::O_EXCL)) {
         (true, true) => "新規作成し、",
         (true, false) => "作成またはオープンし、",
@@ -189,7 +184,13 @@ fn fill(template: &str, v: &InvocationView<'_>) -> String {
     let specific: Vec<(&str, String)> = match v.request {
         SyscallRequest::Openat {
             path, flags, raw_flags, ..
-        } => vec![("path", path.clone()), ("flags_ja", access_ja(flags, *raw_flags))],
+        } => {
+            let decoded = v
+                .open_flags
+                .cloned()
+                .unwrap_or_else(|| DecodedFlags::from_request(flags, *raw_flags));
+            vec![("path", path.clone()), ("flags_ja", access_ja(&decoded))]
+        }
         SyscallRequest::Mkdirat { path, mode, .. } => vec![("path", path.clone()), ("mode", format_mode(*mode))],
         SyscallRequest::Read { fd, count } => {
             let note = if v.ret == 0 && *count > 0 {
@@ -611,8 +612,31 @@ mod tests {
             observation: obs,
             trace_mode: mode,
             notes: &[],
+            open_flags: None,
             denied_by_policy: false,
         }
+    }
+
+    #[test]
+    fn explanation_uses_the_flags_the_kernel_received() {
+        // flags given as a number: only the sandbox knows it means O_PATH
+        let req = SyscallRequest::Openat {
+            dirfd: Dirfd::AtFdcwd,
+            path: ".".into(),
+            flags: vec![],
+            raw_flags: 0x20_0000,
+            mode: None,
+        };
+        let decoded = DecodedFlags {
+            access_mode: 0,
+            named: vec![OpenFlag::O_PATH],
+            unnamed: 0,
+        };
+        let mut v = view(&req, None, &[], None, TraceMode::Requested);
+        v.open_flags = Some(&decoded);
+        let r = render_invocation(Guides::builtin(), GuideLevel::Explained, &v);
+        assert!(r.text.contains("O_PATH"), "{}", r.text);
+        assert!(!r.text.contains("読み込み専用"), "{}", r.text);
     }
 
     #[test]

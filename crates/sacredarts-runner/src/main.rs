@@ -134,7 +134,9 @@ mod linux {
                             marker("begin", req.id);
                             let outcome = runner.invoke(&request);
                             marker("end", req.id);
-                            RunnerReplyBody::Invoked { outcome }
+                            RunnerReplyBody::Invoked {
+                                outcome: Box::new(outcome),
+                            }
                         }
                         RunnerOp::ListHandles => RunnerReplyBody::Handles {
                             handles: runner.handles().list(),

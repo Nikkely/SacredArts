@@ -6,7 +6,7 @@
 //! ```
 
 use crate::policy::Policy;
-use crate::request::SyscallRequest;
+use crate::request::{DecodedFlags, SyscallRequest};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -38,10 +38,17 @@ pub struct RunnerReply {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum RunnerReplyBody {
-    Invoked { outcome: InvokeOutcome },
-    Handles { handles: Vec<HandleInfo> },
+    /// Boxed: the outcome is much larger than the other replies.
+    Invoked {
+        outcome: Box<InvokeOutcome>,
+    },
+    Handles {
+        handles: Vec<HandleInfo>,
+    },
     Pong,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// First line the runner sends after initialisation (seccomp already applied).
@@ -123,6 +130,9 @@ pub enum InvokeOutcome {
         read_data_b64: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         notes: Vec<String>,
+        /// openat only: the flags as the kernel received them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open_flags: Option<DecodedFlags>,
     },
     /// Rejected by application-level validation; nothing was issued.
     Rejected { code: String, message: String },

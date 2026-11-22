@@ -499,12 +499,15 @@ impl Supervisor {
                         kind: None,
                     });
                 }
-                if let Err(e) = sacredarts_policy::compile(&policy) {
-                    return Some(SupervisorMessage::InitFailed {
-                        message: e,
-                        kind: Some(SupervisorErrorKind::InvalidPolicy),
-                    });
-                }
+                let policy = match sacredarts_policy::canonicalize(&policy) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Some(SupervisorMessage::InitFailed {
+                            message: e,
+                            kind: Some(SupervisorErrorKind::InvalidPolicy),
+                        });
+                    }
+                };
                 match self.spawn_runner(&policy) {
                     Ok(p) => {
                         let runner = p.info.clone();
@@ -523,7 +526,7 @@ impl Supervisor {
                         let observation = r.observe(rid);
                         SupervisorMessage::Invoked {
                             id,
-                            outcome,
+                            outcome: *outcome,
                             observation,
                             runner_generation: r.info.generation,
                         }
@@ -580,15 +583,20 @@ impl Supervisor {
             }
             HostMessage::SetPolicy { id, policy } => {
                 // Check the policy before touching the current runner or strace.
-                if let Err(e) = sacredarts_policy::compile(&policy) {
-                    return Some(SupervisorMessage::Error {
-                        id,
-                        kind: SupervisorErrorKind::InvalidPolicy,
-                        message: e,
-                        state_reset: false,
-                        runner: self.runner.as_ref().map(|r| r.info.clone()),
-                    });
-                }
+                // Aliases (EWOULDBLOCK) are stored by their canonical name
+                // (EAGAIN), the name the kernel's errno is reported with.
+                let policy = match sacredarts_policy::canonicalize(&policy) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Some(SupervisorMessage::Error {
+                            id,
+                            kind: SupervisorErrorKind::InvalidPolicy,
+                            message: e,
+                            state_reset: false,
+                            runner: self.runner.as_ref().map(|r| r.info.clone()),
+                        });
+                    }
+                };
                 // Start the new runner first; only switch when it is healthy.
                 match self.spawn_runner(&policy) {
                     Ok(mut new) => match new.request(RunnerOp::Ping, timeout) {

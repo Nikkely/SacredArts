@@ -244,7 +244,8 @@ impl Manager {
                 dead_reason: None,
                 guide_level,
                 trace_mode,
-                policy,
+                // the sandbox reports the policy with canonical errno names
+                policy: runner.policy.clone(),
                 runner,
                 events,
                 next_msg: 1,
@@ -424,6 +425,7 @@ impl Manager {
                 handle_change,
                 read_data_b64,
                 notes,
+                ..
             } => {
                 let ai_ret = match (handle_change, errno) {
                     (Some(HandleChange::Opened { info }), None) => info.handle as i64,
@@ -560,7 +562,8 @@ impl Manager {
         match msg {
             SupervisorMessage::PolicyApplied { runner, .. } => {
                 // Commit only after the supervisor confirmed the switch.
-                st.policy = policy;
+                // The sandbox reports the policy with canonical errno names.
+                st.policy = runner.policy.clone();
                 st.runner = runner.clone();
                 let new_policy = st.policy.clone();
                 st.events.push(lifecycle(

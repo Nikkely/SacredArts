@@ -17,7 +17,7 @@ use base64::Engine;
 use sacredarts_core::format::{DISPLAY_BYTES, format_mode, quote_bytes, quote_str};
 use sacredarts_core::ipc::{HandleChange, InvokeOutcome, IssuedCall, IssuedPurpose};
 use sacredarts_core::limits::MARKER_PREFIX;
-use sacredarts_core::{Dirfd, OpenFlag, SyscallRequest, ValidationError};
+use sacredarts_core::{DecodedFlags, Dirfd, OpenFlag, SyscallRequest, ValidationError};
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
@@ -77,33 +77,29 @@ fn flag_bits(f: OpenFlag) -> libc::c_int {
     }
 }
 
-/// Decode open flags the way strace prints them: the access mode, then the
-/// named bits (multi-bit flags such as O_TMPFILE and O_SYNC first), then any
-/// remaining bits in hex.
-pub fn decode_flags(bits: libc::c_int) -> String {
-    let access = match bits & libc::O_ACCMODE {
-        libc::O_RDONLY => "O_RDONLY".to_string(),
-        libc::O_WRONLY => "O_WRONLY".to_string(),
-        libc::O_RDWR => "O_RDWR".to_string(),
-        m => format!("{m:#x}"),
-    };
-    // Multi-bit flags (O_TMPFILE, O_SYNC) first; an alias (O_NDELAY, O_RSYNC)
-    // never matches because its canonical name comes first and clears the bits.
+/// Decode open flags the way strace does: the access mode, the named bits
+/// (multi-bit flags such as O_TMPFILE and O_SYNC first), then the rest.
+pub fn decode_flags(bits: libc::c_int) -> DecodedFlags {
+    // Multi-bit flags first; an alias (O_NDELAY, O_RSYNC) never matches
+    // because its canonical name comes first and clears the bits.
     let named = || OpenFlag::iter().filter(|f| !f.is_access_mode());
     let multi_bit_first = named()
         .filter(|f| flag_bits(*f).count_ones() > 1)
         .chain(named().filter(|f| flag_bits(*f).count_ones() <= 1));
-    let (names, rest) = multi_bit_first.fold((vec![access], bits & !libc::O_ACCMODE), |(mut names, rest), f| {
+    let (named, rest) = multi_bit_first.fold((Vec::new(), bits & !libc::O_ACCMODE), |(mut names, rest), f| {
         let v = flag_bits(f);
         if v != 0 && rest & v == v {
-            names.push(f.as_str().to_string());
+            names.push(f);
             (names, rest & !v)
         } else {
             (names, rest)
         }
     });
-    let unnamed = (rest != 0).then(|| format!("{rest:#x}"));
-    names.into_iter().chain(unnamed).collect::<Vec<_>>().join("|")
+    DecodedFlags {
+        access_mode: (bits & libc::O_ACCMODE) as u32,
+        named,
+        unnamed: rest as u32,
+    }
 }
 
 /// Convert a raw `syscall(2)` return into (ret, errno).
@@ -178,6 +174,7 @@ impl Runner {
         issued: Vec<IssuedCall>,
         handle_change: Option<HandleChange>,
         read_data: Option<&[u8]>,
+        open_flags: Option<DecodedFlags>,
     ) -> InvokeOutcome {
         InvokeOutcome::Completed {
             requested_executed: true,
@@ -187,12 +184,19 @@ impl Runner {
             handle_change,
             read_data_b64: read_data.map(|d| base64::engine::general_purpose::STANDARD.encode(d)),
             notes: vec![],
+            open_flags,
         }
     }
 
     /// The single requested call, with nothing else to report.
     fn plain(syscall: &str, args: String, r: (i64, Option<i32>)) -> InvokeOutcome {
-        Self::completed(r, vec![call(syscall, IssuedPurpose::Requested, args, r)], None, None)
+        Self::completed(
+            r,
+            vec![call(syscall, IssuedPurpose::Requested, args, r)],
+            None,
+            None,
+            None,
+        )
     }
 
     fn getpid(&mut self) -> InvokeOutcome {
@@ -261,10 +265,10 @@ impl Runner {
         let opened = r.1.is_none().then(|| {
             let label = base.map(|b| label(&b, path)).unwrap_or_else(|| path.to_string());
             HandleChange::Opened {
-                info: self.handles.insert(r.0 as RawFd, label, decoded),
+                info: self.handles.insert(r.0 as RawFd, label, decoded.to_string()),
             }
         });
-        Ok(Self::completed(r, issued, opened, None))
+        Ok(Self::completed(r, issued, opened, None, Some(decoded)))
     }
 
     fn read(&mut self, fd: i32, count: usize) -> Result<InvokeOutcome, Stop> {
@@ -283,7 +287,7 @@ impl Runner {
             format!("{shown_fd}, {shown}, {count}"),
             r,
         )];
-        Ok(Self::completed(r, issued, None, data))
+        Ok(Self::completed(r, issued, None, data, None))
     }
 
     fn write(&mut self, fd: i32, data: &[u8]) -> Result<InvokeOutcome, Stop> {
@@ -321,7 +325,7 @@ impl Runner {
             .then(|| self.handles.remove(fd))
             .flatten()
             .map(|info| HandleChange::Closed { info });
-        Ok(Self::completed(r, issued, closed, None))
+        Ok(Self::completed(r, issued, closed, None, None))
     }
 
     fn mkdirat(&mut self, dirfd: Dirfd, path: &str, mode: u32) -> Result<InvokeOutcome, Stop> {
@@ -352,19 +356,23 @@ fn call(syscall: &str, purpose: IssuedPurpose, args: String, r: (i64, Option<i32
 mod tests {
     use super::*;
 
+    fn decode_flags_str(bits: libc::c_int) -> String {
+        decode_flags(bits).to_string()
+    }
+
     #[test]
     fn decode_like_strace() {
         assert_eq!(
-            decode_flags(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC),
+            decode_flags_str(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC),
             "O_WRONLY|O_CREAT|O_TRUNC"
         );
         // multi-bit flags are named once, not as their parts
-        assert_eq!(decode_flags(libc::O_RDWR | libc::O_TMPFILE), "O_RDWR|O_TMPFILE");
-        assert_eq!(decode_flags(libc::O_WRONLY | libc::O_SYNC), "O_WRONLY|O_SYNC");
-        assert_eq!(decode_flags(libc::O_DSYNC), "O_RDONLY|O_DSYNC");
+        assert_eq!(decode_flags_str(libc::O_RDWR | libc::O_TMPFILE), "O_RDWR|O_TMPFILE");
+        assert_eq!(decode_flags_str(libc::O_WRONLY | libc::O_SYNC), "O_WRONLY|O_SYNC");
+        assert_eq!(decode_flags_str(libc::O_DSYNC), "O_RDONLY|O_DSYNC");
         // aliases use the canonical name
-        assert_eq!(decode_flags(libc::O_NDELAY), "O_RDONLY|O_NONBLOCK");
+        assert_eq!(decode_flags_str(libc::O_NDELAY), "O_RDONLY|O_NONBLOCK");
         // access mode 3 and unnamed bits in hex
-        assert_eq!(decode_flags(3 | 0x4000_0000), "0x3|0x40000000");
+        assert_eq!(decode_flags_str(3 | 0x4000_0000), "0x3|0x40000000");
     }
 }

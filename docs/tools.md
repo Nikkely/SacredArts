@@ -184,6 +184,7 @@ Level 1: 概要とシグネチャ / Level 2: ＋説明・補足（`open` と `op
 
 - `deny` は対応 6 syscall の部分集合のみ（それ以外は `unsupported_syscall`）。空配列で制限解除。
 - `errno`: Linux の errno 名なら何でも（既定 `EPERM`。`ENOSYS`、`EIO` など）。名前から番号への変換はサンドボックス内の glibc（`strerrorname_np`）で行い、知らない名前なら `invalid_policy`（入力の誤り）で失敗し、元のポリシーが残ります（ホスト側では名前の形を推測で検査しません）。
+  別名（`EWOULDBLOCK`、`ENOTSUP`、`EDEADLOCK`）も使えます。カーネルの errno は正式名で報告されるので、ポリシーも正式名（`EAGAIN` など）で保存・表示します。
 - Runner を新しい seccomp フィルタ付きで再作成します。**開いていた fd は失われます**（`state_reset: true`）。
 
 出力（抜粋）:
