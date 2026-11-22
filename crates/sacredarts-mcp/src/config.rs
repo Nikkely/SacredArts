@@ -66,6 +66,14 @@ fn env_secs_opt(key: &str, default: u64, min: u64, max: u64) -> Option<Duration>
     }
 }
 
+fn env_usize(key: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
 fn env_u64(key: &str, default: u64, min: u64, max: u64) -> u64 {
     std::env::var(key)
         .ok()
@@ -110,14 +118,14 @@ impl Config {
             },
             docker_bin: find_docker(),
             image: std::env::var("SACREDARTS_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.to_string()),
-            max_sessions: env_u64("SACREDARTS_MAX_SESSIONS", 4, 1, 16) as usize,
+            max_sessions: env_usize("SACREDARTS_MAX_SESSIONS", 4, 1, 16),
             // Learning sessions are often paused for a while: 4 h idle, 24 h total.
             idle_timeout: env_secs_opt("SACREDARTS_IDLE_TIMEOUT_SECS", 4 * 3600, 60, 30 * 86_400),
             max_lifetime: env_secs_opt("SACREDARTS_MAX_LIFETIME_SECS", 24 * 3600, 60, 30 * 86_400),
             request_timeout: Duration::from_millis(env_u64("SACREDARTS_REQUEST_TIMEOUT_MS", 5000, 200, 60_000)),
             ipc_margin: Duration::from_secs(15),
             startup_timeout: Duration::from_secs(env_u64("SACREDARTS_STARTUP_TIMEOUT_SECS", 30, 5, 300)),
-            events_per_session: env_u64("SACREDARTS_EVENTS_PER_SESSION", 2000, 100, 100_000) as usize,
+            events_per_session: env_usize("SACREDARTS_EVENTS_PER_SESSION", 2000, 100, 100_000),
         }
     }
 }

@@ -196,6 +196,7 @@ pub enum SyscallRequest {
     },
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
 fn is_zero(v: &u32) -> bool {
     *v == 0
 }
@@ -439,7 +440,8 @@ fn flag_bits_from_number(n: &serde_json::Number) -> Option<u32> {
         u32::try_from(u).ok()
     } else {
         // negative ints are passed as their two's complement bits, like C
-        n.as_i64().and_then(|i| i32::try_from(i).ok()).map(|i| i as u32)
+        // negative ints are reinterpreted as their bit pattern, as in C
+        n.as_i64().and_then(|i| i32::try_from(i).ok()).map(i32::cast_unsigned)
     }
 }
 
@@ -543,10 +545,9 @@ fn parse_count(v: Option<&Value>, field: &str) -> Result<Option<usize>, Validati
     match v {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(n)) => {
-            let c = n
-                .as_u64()
-                .ok_or_else(|| ValidationError::new("invalid_argument", format!("{field} must be >= 0")).field(field))?
-                as usize;
+            let c = n.as_u64().and_then(|c| usize::try_from(c).ok()).ok_or_else(|| {
+                ValidationError::new("invalid_argument", format!("{field} must be >= 0")).field(field)
+            })?;
             check_count(c, field)?;
             Ok(Some(c))
         }

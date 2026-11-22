@@ -58,15 +58,15 @@ impl Mcp {
                 }
             }
         });
-        let mut m = Mcp {
+        let mut mcp = Mcp {
             stdin: child.stdin.take(),
             child,
             rx,
             next: 0,
         };
-        let init = m.rpc(
+        let init = mcp.rpc(
             "initialize",
-            json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "acceptance", "version": "0"}}),
+            &json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "acceptance", "version": "0"}}),
         );
         assert_eq!(init["result"]["serverInfo"]["name"], "sacredarts");
         let ins = init["result"]["instructions"].as_str().unwrap_or_default();
@@ -74,8 +74,8 @@ impl Mcp {
             ins.contains("ACTIVATION RULE"),
             "activation rule is sent to the client: {ins}"
         );
-        m.notify("notifications/initialized");
-        m
+        mcp.notify("notifications/initialized");
+        mcp
     }
 
     fn write(&mut self, v: &Value) {
@@ -88,7 +88,7 @@ impl Mcp {
         self.write(&json!({"jsonrpc": "2.0", "method": method}));
     }
 
-    fn rpc(&mut self, method: &str, params: Value) -> Value {
+    fn rpc(&mut self, method: &str, params: &Value) -> Value {
         self.next += 1;
         let id = self.next;
         self.write(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
@@ -103,8 +103,8 @@ impl Mcp {
         }
     }
 
-    fn tool(&mut self, name: &str, args: Value) -> Res {
-        let r = self.rpc("tools/call", json!({"name": name, "arguments": args}));
+    fn tool(&mut self, name: &str, args: &Value) -> Res {
+        let r = self.rpc("tools/call", &json!({"name": name, "arguments": args}));
         let res = &r["result"];
         assert!(res.is_object(), "protocol error: {r}");
         Res {
@@ -114,11 +114,14 @@ impl Mcp {
         }
     }
 
-    fn invoke(&mut self, sid: &str, name: &str, args: Value) -> Res {
-        self.tool("syscall_invoke", json!({"session_id": sid, "name": name, "args": args}))
+    fn invoke(&mut self, sid: &str, name: &str, args: &Value) -> Res {
+        self.tool(
+            "syscall_invoke",
+            &json!({"session_id": sid, "name": name, "args": args}),
+        )
     }
 
-    fn create(&mut self, args: Value) -> String {
+    fn create(&mut self, args: &Value) -> String {
         let r = self.tool("sandbox_create", args).ok();
         r.v["session_id"].as_str().unwrap().to_string()
     }
@@ -192,57 +195,60 @@ fn preflight() {
 #[ignore = "requires Docker Desktop and the sandbox image"]
 fn t01_04_create_write_read_state() {
     preflight();
-    let mut m = Mcp::start(&[]);
-    let r = m.tool("sandbox_create", json!({"guide_level": 1})).ok();
-    let sid = r.v["session_id"].as_str().unwrap().to_string();
-    assert_eq!(r.v["status"], "ready");
-    assert_eq!(r.v["architecture"], std::env::consts::ARCH.replace("arm64", "aarch64"));
+    let mut mcp = Mcp::start(&[]);
+    let created = mcp.tool("sandbox_create", &json!({"guide_level": 1})).ok();
+    let sid = created.v["session_id"].as_str().unwrap().to_string();
+    assert_eq!(created.v["status"], "ready");
+    assert_eq!(
+        created.v["architecture"],
+        std::env::consts::ARCH.replace("arm64", "aarch64")
+    );
     let name = container_of(&sid);
     assert!(container_exists(&name), "Test 1: container exists");
     let (_, labels) = docker(&["inspect", "--format", "{{json .Config.Labels}}", &name]);
     assert!(labels.contains(&sid), "session label set: {labels}");
 
     // Test 2
-    let o = m
+    let opened = mcp
         .invoke(
             &sid,
             "openat",
-            json!({"path": "/workspace/hello.txt", "flags": ["O_CREAT", "O_WRONLY"], "mode": "0644"}),
+            &json!({"path": "/workspace/hello.txt", "flags": ["O_CREAT", "O_WRONLY"], "mode": "0644"}),
         )
         .ok();
-    assert_eq!(o.v["success"], true);
-    let h = o.v["return_value"].as_i64().unwrap();
-    assert_eq!(h, 3);
-    assert!(o.v["handle"]["real_fd"].as_i64().unwrap() >= 0);
+    assert_eq!(opened.v["success"], true);
+    let fd = opened.v["return_value"].as_i64().unwrap();
+    assert_eq!(fd, 3);
+    assert!(opened.v["handle"]["real_fd"].as_i64().unwrap() >= 0);
     assert_eq!(
-        o.text,
+        opened.text,
         r#"openat(AT_FDCWD, "/workspace/hello.txt", O_WRONLY|O_CREAT, 0644) = 3"#
     );
     // Test 4: the handle survives across separate MCP calls
-    let i = m.tool("sandbox_inspect", json!({"session_id": sid})).ok();
-    assert_eq!(i.v["open_handles"][0]["handle"], 3);
-    assert_eq!(i.v["cwd"], "/workspace");
-    let w = m.invoke(&sid, "write", json!({"fd": h, "data": "Hello"})).ok();
-    assert_eq!(w.v["return_value"], 5);
-    assert_eq!(w.text, r#"write(3, "Hello", 5) = 5"#);
-    let c = m.invoke(&sid, "close", json!({"fd": h})).ok();
-    assert_eq!(c.v["return_value"], 0);
+    let inspected = mcp.tool("sandbox_inspect", &json!({"session_id": sid})).ok();
+    assert_eq!(inspected.v["open_handles"][0]["handle"], 3);
+    assert_eq!(inspected.v["cwd"], "/workspace");
+    let written = mcp.invoke(&sid, "write", &json!({"fd": fd, "data": "Hello"})).ok();
+    assert_eq!(written.v["return_value"], 5);
+    assert_eq!(written.text, r#"write(3, "Hello", 5) = 5"#);
+    let closed = mcp.invoke(&sid, "close", &json!({"fd": fd})).ok();
+    assert_eq!(closed.v["return_value"], 0);
 
     // Test 3
-    let o = m
-        .invoke(&sid, "openat", json!({"path": "hello.txt", "flags": ["O_RDONLY"]}))
+    let opened = mcp
+        .invoke(&sid, "openat", &json!({"path": "hello.txt", "flags": ["O_RDONLY"]}))
         .ok();
-    assert_eq!(o.v["return_value"], 3, "closed handle number is reused");
-    let rd = m.invoke(&sid, "read", json!({"fd": 3, "count": 64})).ok();
+    assert_eq!(opened.v["return_value"], 3, "closed handle number is reused");
+    let rd = mcp.invoke(&sid, "read", &json!({"fd": 3, "count": 64})).ok();
     assert_eq!(rd.v["return_value"], 5);
     assert_eq!(rd.v["data_text"], "Hello");
     assert_eq!(rd.text, r#"read(3, "Hello", 64) = 5"#);
-    let rd = m.invoke(&sid, "read", json!({"fd": 3, "count": 64})).ok();
+    let rd = mcp.invoke(&sid, "read", &json!({"fd": 3, "count": 64})).ok();
     assert_eq!(rd.v["return_value"], 0, "EOF");
 
-    m.tool("sandbox_destroy", json!({"session_id": sid})).ok();
+    mcp.tool("sandbox_destroy", &json!({"session_id": sid})).ok();
     assert!(wait_gone(&name, 20));
-    m.shutdown();
+    mcp.shutdown();
 }
 
 /// Test 5: the same operation rendered at guide levels 1, 2, 3.
@@ -250,24 +256,27 @@ fn t01_04_create_write_read_state() {
 #[ignore = "requires Docker Desktop and the sandbox image"]
 fn t05_guide_levels() {
     preflight();
-    let mut m = Mcp::start(&[]);
-    let sid = m.create(json!({}));
+    let mut mcp = Mcp::start(&[]);
+    let sid = mcp.create(&json!({}));
     let args = json!({"path": "/workspace/g.txt", "flags": ["O_CREAT", "O_WRONLY"], "mode": "0644"});
     let mut texts = vec![];
     for level in 1..=3 {
-        m.tool("session_set_guide", json!({"session_id": sid, "guide_level": level}))
+        mcp.tool("session_set_guide", &json!({"session_id": sid, "guide_level": level}))
             .ok();
-        let r = m.invoke(&sid, "openat", args.clone()).ok();
-        assert_eq!(r.v["guide"]["level"], level);
-        texts.push(r.text);
+        let rendered = mcp.invoke(&sid, "openat", &args).ok();
+        assert_eq!(rendered.v["guide"]["level"], level);
+        texts.push(rendered.text);
     }
     // handles 3,4,5 -> state kept across guide changes (runner not recreated)
-    let i = m.tool("sandbox_inspect", json!({"session_id": sid})).ok();
-    assert_eq!(i.v["open_handles"].as_array().unwrap().len(), 3);
-    assert_eq!(i.v["runner"]["generation"], 1);
+    let inspected = mcp.tool("sandbox_inspect", &json!({"session_id": sid})).ok();
+    assert_eq!(inspected.v["open_handles"].as_array().unwrap().len(), 3);
+    assert_eq!(inspected.v["runner"]["generation"], 1);
 
-    let strip = |t: &str| t.lines().next().unwrap().rsplit_once(" = ").unwrap().0.to_string();
-    assert!(texts.iter().all(|t| strip(t) == strip(&texts[0])), "same call line");
+    let strip = |text: &str| text.lines().next().unwrap().rsplit_once(" = ").unwrap().0.to_string();
+    assert!(
+        texts.iter().all(|text| strip(text) == strip(&texts[0])),
+        "same call line"
+    );
     assert_eq!(texts[0].lines().count(), 1, "Level 1: syscall only:\n{}", texts[0]);
     assert!(!texts[0].contains("解説"));
     assert!(texts[1].contains("解説") && texts[1].contains("ファイルディスクリプタ"));
@@ -286,13 +295,13 @@ fn t05_guide_levels() {
         assert!(texts[2].contains(needle), "Level 3 lacks {needle}");
     }
     // describe works without a sandbox, incl. open vs openat
-    let d = m
-        .tool("syscall_describe", json!({"name": "open", "guide_level": 3}))
+    let described = mcp
+        .tool("syscall_describe", &json!({"name": "open", "guide_level": 3}))
         .ok();
-    assert_eq!(d.v["executable"], false);
-    assert!(d.text.contains("openat(AT_FDCWD"));
-    m.tool("sandbox_destroy", json!({"session_id": sid})).ok();
-    m.shutdown();
+    assert_eq!(described.v["executable"], false);
+    assert!(described.text.contains("openat(AT_FDCWD"));
+    mcp.tool("sandbox_destroy", &json!({"session_id": sid})).ok();
+    mcp.shutdown();
 }
 
 /// Test 6: strace observation, requested vs observed events.
@@ -300,25 +309,25 @@ fn t05_guide_levels() {
 #[ignore = "requires Docker Desktop and the sandbox image"]
 fn t06_strace_observation() {
     preflight();
-    let mut m = Mcp::start(&[]);
-    let r = m.tool("sandbox_create", json!({"trace_mode": "all"})).ok();
-    let sid = r.v["session_id"].as_str().unwrap().to_string();
+    let mut mcp = Mcp::start(&[]);
+    let created = mcp.tool("sandbox_create", &json!({"trace_mode": "all"})).ok();
+    let sid = created.v["session_id"].as_str().unwrap().to_string();
     assert_eq!(
-        r.v["tracing"]["state"], "active",
+        created.v["tracing"]["state"], "active",
         "strace must work on Docker Desktop: {}",
-        r.text
+        created.text
     );
-    let o = m
+    let opened = mcp
         .invoke(
             &sid,
             "openat",
-            json!({"path": "obs.txt", "flags": ["O_CREAT", "O_RDWR"], "mode": "0600"}),
+            &json!({"path": "obs.txt", "flags": ["O_CREAT", "O_RDWR"], "mode": "0600"}),
         )
         .ok();
-    assert_eq!(o.v["observation"]["status"], "complete");
-    let real_fd = o.v["handle"]["real_fd"].as_i64().unwrap();
-    assert!(o.text.contains("# kernel (strace):"));
-    let obs: Vec<String> = o.v["observation"]["syscalls"]
+    assert_eq!(opened.v["observation"]["status"], "complete");
+    let real_fd = opened.v["handle"]["real_fd"].as_i64().unwrap();
+    assert!(opened.text.contains("# kernel (strace):"));
+    let obs: Vec<String> = opened.v["observation"]["syscalls"]
         .as_array()
         .unwrap()
         .iter()
@@ -332,12 +341,12 @@ fn t06_strace_observation() {
         "{obs:?}"
     );
 
-    let t = m.tool("trace_get", json!({"session_id": sid, "limit": 100})).ok();
-    let ev = t.v["events"].as_array().unwrap();
+    let trace = mcp.tool("trace_get", &json!({"session_id": sid, "limit": 100})).ok();
+    let ev = trace.v["events"].as_array().unwrap();
     let req: Vec<&Value> = ev.iter().filter(|e| e["kind"] == "requested").collect();
     let seen: Vec<&Value> = ev.iter().filter(|e| e["kind"] == "observed").collect();
     assert_eq!(req.len(), 1);
-    assert!(!seen.is_empty());
+    assert_ne!(seen, [] as [&serde_json::Value; 0]);
     assert_eq!(req[0]["source"], "ai_request");
     assert_eq!(
         req[0]["return_value"], 3,
@@ -351,44 +360,44 @@ fn t06_strace_observation() {
         assert!(s["duration_ns"].is_u64());
     }
     // trace_mode=requested hides observed events
-    let t = m
-        .tool("trace_get", json!({"session_id": sid, "trace_mode": "requested"}))
+    let trace = mcp
+        .tool("trace_get", &json!({"session_id": sid, "trace_mode": "requested"}))
         .ok();
     assert!(
-        t.v["events"]
+        trace.v["events"]
             .as_array()
             .unwrap()
             .iter()
             .all(|e| e["kind"] != "observed")
     );
     // paging
-    let t = m.tool("trace_get", json!({"session_id": sid, "limit": 1})).ok();
-    let cursor = t.v["next_after_event_id"].as_u64().unwrap();
-    let t2 = m
+    let trace = mcp.tool("trace_get", &json!({"session_id": sid, "limit": 1})).ok();
+    let cursor = trace.v["next_after_event_id"].as_u64().unwrap();
+    let t2 = mcp
         .tool(
             "trace_get",
-            json!({"session_id": sid, "limit": 1, "after_event_id": cursor}),
+            &json!({"session_id": sid, "limit": 1, "after_event_id": cursor}),
         )
         .ok();
     assert!(t2.v["events"][0]["event_id"].as_u64().unwrap() > cursor);
     // brackets in a file name appear unescaped in strace's fd annotations;
     // the write must still be observed
-    let o = m
+    let opened = mcp
         .invoke(
             &sid,
             "openat",
-            json!({"path": "a(b>c[d", "flags": "O_WRONLY|O_CREAT", "mode": "0644"}),
+            &json!({"path": "a(b>c[d", "flags": "O_WRONLY|O_CREAT", "mode": "0644"}),
         )
         .ok();
-    let fd = o.v["return_value"].as_i64().unwrap();
-    let w = m.invoke(&sid, "write", json!({"fd": fd, "data": "x"})).ok();
-    let syscalls = w.v["observation"]["syscalls"].as_array().unwrap();
+    let fd = opened.v["return_value"].as_i64().unwrap();
+    let written = mcp.invoke(&sid, "write", &json!({"fd": fd, "data": "x"})).ok();
+    let syscalls = written.v["observation"]["syscalls"].as_array().unwrap();
     assert!(
         syscalls.iter().any(|l| l.as_str().unwrap().contains("write(")),
         "{syscalls:?}"
     );
-    m.tool("sandbox_destroy", json!({"session_id": sid})).ok();
-    m.shutdown();
+    mcp.tool("sandbox_destroy", &json!({"session_id": sid})).ok();
+    mcp.shutdown();
 }
 
 /// Test 7: seccomp denies mkdirat in the kernel; a fresh runner without the
@@ -397,96 +406,100 @@ fn t06_strace_observation() {
 #[ignore = "requires Docker Desktop and the sandbox image"]
 fn t07_seccomp() {
     preflight();
-    let mut m = Mcp::start(&[]);
-    let r = m
+    let mut mcp = Mcp::start(&[]);
+    let created = mcp
         .tool(
             "sandbox_create",
-            json!({"guide_level": 2, "trace_mode": "all", "policy": {"deny": ["mkdirat"], "errno": "EPERM"}}),
+            &json!({"guide_level": 2, "trace_mode": "all", "policy": {"deny": ["mkdirat"], "errno": "EPERM"}}),
         )
         .ok();
-    let sid = r.v["session_id"].as_str().unwrap().to_string();
-    let filters_with = r.v["seccomp"]["filters"].as_u64().unwrap();
-    assert_eq!(r.v["seccomp"]["sacredarts_filter_installed"], true);
-    let ev = r.v["seccomp_evidence"].to_string();
+    let sid = created.v["session_id"].as_str().unwrap().to_string();
+    let filters_with = created.v["seccomp"]["filters"].as_u64().unwrap();
+    assert_eq!(created.v["seccomp"]["sacredarts_filter_installed"], true);
+    let ev = created.v["seccomp_evidence"].to_string();
     assert!(
         ev.contains("seccomp(SECCOMP_SET_MODE_FILTER"),
         "strace saw the filter being installed: {ev}"
     );
 
-    let d = m.invoke(&sid, "mkdirat", json!({"path": "test", "mode": "0755"})).ok();
-    assert_eq!(d.v["success"], false);
-    assert_eq!(d.v["errno"]["name"], "EPERM");
-    assert_eq!(d.v["denied_by_policy"], true);
+    let made = mcp
+        .invoke(&sid, "mkdirat", &json!({"path": "test", "mode": "0755"}))
+        .ok();
+    assert_eq!(made.v["success"], false);
+    assert_eq!(made.v["errno"]["name"], "EPERM");
+    assert_eq!(made.v["denied_by_policy"], true);
     assert_eq!(
-        d.v["requested_syscall_executed"], true,
+        made.v["requested_syscall_executed"], true,
         "runner issued mkdirat; no app-level branch"
     );
     assert!(
-        d.text
+        made.text
             .starts_with(r#"mkdirat(AT_FDCWD, "test", 0755) = -1 EPERM (Operation not permitted)"#),
         "{}",
-        d.text
+        made.text
     );
-    assert!(d.text.contains("seccomp"));
-    let kernel = d.v["observation"]["syscalls"].to_string();
+    assert!(made.text.contains("seccomp"));
+    let kernel = made.v["observation"]["syscalls"].to_string();
     assert!(
-        kernel.contains(r#"mkdirat("#) && kernel.contains("= -1 EPERM"),
+        kernel.contains(r"mkdirat(") && kernel.contains("= -1 EPERM"),
         "strace saw the kernel reject it: {kernel}"
     );
-    let i = m.tool("sandbox_inspect", json!({"session_id": sid})).ok();
+    let inspected = mcp.tool("sandbox_inspect", &json!({"session_id": sid})).ok();
     assert!(
-        i.v["workspace_entries"]
+        inspected.v["workspace_entries"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|e| e["name"] != "test")
+            .all(|failure| failure["name"] != "test")
     );
 
-    let p = m.tool("policy_set", json!({"session_id": sid, "deny": []})).ok();
-    assert_eq!(p.v["state_reset"], true);
-    assert_eq!(p.v["runner"]["generation"], 2);
+    let applied = mcp.tool("policy_set", &json!({"session_id": sid, "deny": []})).ok();
+    assert_eq!(applied.v["state_reset"], true);
+    assert_eq!(applied.v["runner"]["generation"], 2);
     assert_eq!(
-        p.v["seccomp"]["filters"].as_u64().unwrap(),
+        applied.v["seccomp"]["filters"].as_u64().unwrap(),
         filters_with - 1,
         "our filter is gone in the new runner"
     );
-    let d = m.invoke(&sid, "mkdirat", json!({"path": "test", "mode": "0755"})).ok();
-    assert_eq!(d.v["success"], true);
-    assert_eq!(d.v["return_value"], 0);
+    let made = mcp
+        .invoke(&sid, "mkdirat", &json!({"path": "test", "mode": "0755"}))
+        .ok();
+    assert_eq!(made.v["success"], true);
+    assert_eq!(made.v["return_value"], 0);
 
     // invalid policies are rejected and do not touch the session
-    m.tool("policy_set", json!({"session_id": sid, "deny": ["sendto"]}))
+    mcp.tool("policy_set", &json!({"session_id": sid, "deny": ["sendto"]}))
         .err("unsupported_syscall");
     // any errno name works; an unknown one fails inside the sandbox and the old policy stays
-    m.tool(
+    mcp.tool(
         "policy_set",
-        json!({"session_id": sid, "deny": ["getpid"], "errno": "EIO"}),
+        &json!({"session_id": sid, "deny": ["getpid"], "errno": "EIO"}),
     )
     .ok();
-    let g = m.invoke(&sid, "getpid", json!({})).ok();
-    assert_eq!(g.v["errno"]["name"], "EIO");
-    let e = m
+    let getpid = mcp.invoke(&sid, "getpid", &json!({})).ok();
+    assert_eq!(getpid.v["errno"]["name"], "EIO");
+    let failure = mcp
         .tool(
             "policy_set",
-            json!({"session_id": sid, "deny": ["getpid"], "errno": "ENOTANERRNO"}),
+            &json!({"session_id": sid, "deny": ["getpid"], "errno": "ENOTANERRNO"}),
         )
         .err("invalid_policy");
-    assert_eq!(e.v["error"]["kind"], "invalid_argument");
-    let g = m.invoke(&sid, "getpid", json!({})).ok();
-    assert_eq!(g.v["errno"]["name"], "EIO", "previous policy still active");
+    assert_eq!(failure.v["error"]["kind"], "invalid_argument");
+    let getpid = mcp.invoke(&sid, "getpid", &json!({})).ok();
+    assert_eq!(getpid.v["errno"]["name"], "EIO", "previous policy still active");
     // aliases are accepted and stored by their canonical name
-    let p = m
+    let applied = mcp
         .tool(
             "policy_set",
-            json!({"session_id": sid, "deny": ["getpid"], "errno": "EWOULDBLOCK"}),
+            &json!({"session_id": sid, "deny": ["getpid"], "errno": "EWOULDBLOCK"}),
         )
         .ok();
-    assert_eq!(p.v["policy"]["errno"], "EAGAIN");
-    let g = m.invoke(&sid, "getpid", json!({})).ok();
-    assert_eq!(g.v["errno"]["name"], "EAGAIN");
-    assert_eq!(g.v["denied_by_policy"], true);
-    m.tool("sandbox_destroy", json!({"session_id": sid})).ok();
-    m.shutdown();
+    assert_eq!(applied.v["policy"]["errno"], "EAGAIN");
+    let getpid = mcp.invoke(&sid, "getpid", &json!({})).ok();
+    assert_eq!(getpid.v["errno"]["name"], "EAGAIN");
+    assert_eq!(getpid.v["denied_by_policy"], true);
+    mcp.tool("sandbox_destroy", &json!({"session_id": sid})).ok();
+    mcp.shutdown();
 }
 
 /// Test 8: error handling.
@@ -494,70 +507,72 @@ fn t07_seccomp() {
 #[ignore = "requires Docker Desktop and the sandbox image"]
 fn t08_errors() {
     preflight();
-    let mut m = Mcp::start(&[("SACREDARTS_REQUEST_TIMEOUT_MS", "1500")]);
-    let sid = m.create(json!({}));
+    let mut mcp = Mcp::start(&[("SACREDARTS_REQUEST_TIMEOUT_MS", "1500")]);
+    let sid = mcp.create(&json!({}));
     // invalid fd: the kernel answers EBADF (a Linux error, not a tool error)
-    let r = m.invoke(&sid, "close", json!({"fd": 99})).ok();
-    assert_eq!(r.v["success"], false);
-    assert_eq!(r.v["errno"]["name"], "EBADF");
+    let reply = mcp.invoke(&sid, "close", &json!({"fd": 99})).ok();
+    assert_eq!(reply.v["success"], false);
+    assert_eq!(reply.v["errno"]["name"], "EBADF");
     // invalid argument
-    m.invoke(
+    mcp.invoke(
         &sid,
         "openat",
-        json!({"path": "x", "flags": ["O_CREAT"], "mode": "nope"}),
+        &json!({"path": "x", "flags": ["O_CREAT"], "mode": "nope"}),
     )
     .err("invalid_mode");
-    m.invoke(&sid, "read", json!({"fd": 3})).err("missing_argument");
-    m.tool("sandbox_create", json!({"guide_level": 7}))
+    mcp.invoke(&sid, "read", &json!({"fd": 3})).err("missing_argument");
+    mcp.tool("sandbox_create", &json!({"guide_level": 7}))
         .err("invalid_guide_level");
-    m.tool(
+    mcp.tool(
         "sandbox_create",
-        json!({"policy": {"deny": ["getpid"], "errno": "ENOPE"}}),
+        &json!({"policy": {"deny": ["getpid"], "errno": "ENOPE"}}),
     )
     .err("invalid_policy");
     // unsupported syscall
-    let e = m.invoke(&sid, "execve", json!({})).err("unsupported_syscall");
-    assert_eq!(e.v["error"]["kind"], "unsupported_syscall");
+    let failure = mcp.invoke(&sid, "execve", &json!({})).err("unsupported_syscall");
+    assert_eq!(failure.v["error"]["kind"], "unsupported_syscall");
     // missing file: a Linux error, not a tool error
-    let r = m.invoke(&sid, "openat", json!({"path": "nope.txt"})).ok();
-    assert_eq!(r.v["success"], false);
-    assert_eq!(r.v["errno"]["name"], "ENOENT");
+    let reply = mcp.invoke(&sid, "openat", &json!({"path": "nope.txt"})).ok();
+    assert_eq!(reply.v["success"], false);
+    assert_eq!(reply.v["errno"]["name"], "ENOENT");
     // unknown session
-    m.invoke("00000000-0000-0000-0000-000000000000", "getpid", json!({}))
+    mcp.invoke("00000000-0000-0000-0000-000000000000", "getpid", &json!({}))
         .err("session_not_found");
 
     // execution timeout: opening a FIFO for reading blocks until a writer appears
     let name = container_of(&sid);
     let (ok, out) = docker(&["exec", &name, "mkfifo", "/workspace/fifo"]);
     assert!(ok, "{out}");
-    m.invoke(
+    mcp.invoke(
         &sid,
         "openat",
-        json!({"path": "keep.txt", "flags": ["O_CREAT", "O_WRONLY"], "mode": "0644"}),
+        &json!({"path": "keep.txt", "flags": ["O_CREAT", "O_WRONLY"], "mode": "0644"}),
     )
     .ok();
     let t0 = Instant::now();
-    let e = m.invoke(&sid, "openat", json!({"path": "fifo"})).err("syscall_timeout");
-    assert_eq!(e.v["error"]["kind"], "timeout");
-    assert_eq!(e.v["error"]["details"]["state_reset"], true);
+    let failure = mcp
+        .invoke(&sid, "openat", &json!({"path": "fifo"}))
+        .err("syscall_timeout");
+    assert_eq!(failure.v["error"]["kind"], "timeout");
+    assert_eq!(failure.v["error"]["details"]["state_reset"], true);
     assert!(t0.elapsed() < Duration::from_secs(15));
     // the session still works with a fresh runner; old handles are gone
-    let i = m.tool("sandbox_inspect", json!({"session_id": sid})).ok();
-    assert_eq!(i.v["runner"]["generation"], 2);
-    assert_eq!(i.v["open_handles"].as_array().unwrap().len(), 0);
-    m.invoke(&sid, "getpid", json!({})).ok();
-    m.tool("sandbox_destroy", json!({"session_id": sid})).ok();
+    let inspected = mcp.tool("sandbox_inspect", &json!({"session_id": sid})).ok();
+    assert_eq!(inspected.v["runner"]["generation"], 2);
+    assert_eq!(inspected.v["open_handles"].as_array().unwrap().len(), 0);
+    mcp.invoke(&sid, "getpid", &json!({})).ok();
+    mcp.tool("sandbox_destroy", &json!({"session_id": sid})).ok();
     assert!(
         wait_gone(&name, 20),
         "Test 10: no container left after a timeout + destroy"
     );
-    m.shutdown();
+    mcp.shutdown();
 
     // Docker unavailable
-    let mut m = Mcp::start(&[("DOCKER_HOST", "unix:///nonexistent/sacredarts-test.sock")]);
-    let e = m.tool("sandbox_create", json!({})).err("docker_unavailable");
-    assert_eq!(e.v["error"]["kind"], "infrastructure");
-    m.shutdown();
+    let mut mcp = Mcp::start(&[("DOCKER_HOST", "unix:///nonexistent/sacredarts-test.sock")]);
+    let failure = mcp.tool("sandbox_create", &json!({})).err("docker_unavailable");
+    assert_eq!(failure.v["error"]["kind"], "infrastructure");
+    mcp.shutdown();
 }
 
 /// Test 9: isolation.
@@ -565,99 +580,132 @@ fn t08_errors() {
 #[ignore = "requires Docker Desktop and the sandbox image"]
 fn t09_isolation() {
     preflight();
-    let mut m = Mcp::start(&[]);
-    let sid = m.create(json!({}));
+    let mut mcp = Mcp::start(&[]);
+    let sid = mcp.create(&json!({}));
     let name = container_of(&sid);
-    // Paths are not confined by SacredArts: the kernel decides, inside the
-    // container (non-root, read-only root filesystem).
-    let errno = |m: &mut Mcp, name: &str, args: Value| {
-        let r = m.invoke(&sid, name, args).ok();
-        assert_eq!(r.v["requested_syscall_executed"], true);
-        r.v["errno"]["name"].as_str().map(str::to_string)
+    paths_are_decided_by_the_kernel(&mut mcp, &sid);
+    fds_flags_and_limits_are_the_kernels(&mut mcp, &sid);
+    control_channels_survive_abuse(&mut mcp, &sid);
+    container_is_hardened(&name);
+
+    // state is discarded on destroy
+    mcp.invoke(
+        &sid,
+        "openat",
+        &json!({"path": "secret.txt", "flags": ["O_CREAT", "O_WRONLY"], "mode": "0600"}),
+    )
+    .ok();
+    mcp.tool("sandbox_destroy", &json!({"session_id": sid})).ok();
+    assert!(wait_gone(&name, 20));
+    mcp.invoke(&sid, "getpid", &json!({})).err("session_not_found");
+    mcp.shutdown();
+}
+
+/// Paths are not confined by SacredArts: the kernel decides, inside the
+/// container (non-root, read-only root filesystem).
+fn paths_are_decided_by_the_kernel(mcp: &mut Mcp, sid: &str) {
+    let errno = |mcp: &mut Mcp, name: &str, args: &Value| {
+        let reply = mcp.invoke(sid, name, args).ok();
+        assert_eq!(reply.v["requested_syscall_executed"], true);
+        reply.v["errno"]["name"].as_str().map(str::to_string)
     };
     assert_eq!(
-        errno(&mut m, "openat", json!({"path": "/etc/passwd"})),
+        errno(mcp, "openat", &json!({"path": "/etc/passwd"})),
         None,
         "world-readable"
     );
     assert_eq!(
-        errno(&mut m, "openat", json!({"path": "../etc/hostname"})),
+        errno(mcp, "openat", &json!({"path": "../etc/hostname"})),
         None,
         "'..' resolved by the kernel"
     );
     assert_eq!(
-        errno(&mut m, "openat", json!({"path": "/etc/shadow"})).as_deref(),
+        errno(mcp, "openat", &json!({"path": "/etc/shadow"})).as_deref(),
         Some("EACCES"),
         "not root"
     );
     assert_eq!(
         errno(
-            &mut m,
+            mcp,
             "openat",
-            json!({"path": "/etc/x", "flags": ["O_WRONLY", "O_CREAT"], "mode": "0644"})
+            &json!({"path": "/etc/x", "flags": ["O_WRONLY", "O_CREAT"], "mode": "0644"})
         )
         .as_deref(),
         Some("EROFS"),
         "read-only root filesystem"
     );
     assert_eq!(
-        errno(&mut m, "mkdirat", json!({"path": "/usr/x"})).as_deref(),
+        errno(mcp, "mkdirat", &json!({"path": "/usr/x"})).as_deref(),
         Some("EROFS")
     );
     assert_eq!(
-        errno(&mut m, "openat", json!({"path": "/usr/bin/sh", "flags": ["O_WRONLY"]})).as_deref(),
+        errno(mcp, "openat", &json!({"path": "/usr/bin/sh", "flags": ["O_WRONLY"]})).as_deref(),
         Some("EACCES")
     );
     assert_eq!(
-        errno(&mut m, "mkdirat", json!({"path": "/tmp/t"})),
+        errno(mcp, "mkdirat", &json!({"path": "/tmp/t"})),
         None,
         "tmpfs is writable"
     );
+}
+
+fn fds_flags_and_limits_are_the_kernels(mcp: &mut Mcp, sid: &str) {
     // fds, flags and limits are the kernel's
-    let r = m.invoke(&sid, "read", json!({"fd": 0, "count": 1})).ok();
-    assert_eq!(r.v["return_value"], 0, "fd 0 is /dev/null");
-    let r = m
+    let reply = mcp.invoke(sid, "read", &json!({"fd": 0, "count": 1})).ok();
+    assert_eq!(reply.v["return_value"], 0, "fd 0 is /dev/null");
+    let reply = mcp
         .invoke(
-            &sid,
+            sid,
             "openat",
-            json!({"path": "/tmp", "flags": "O_RDWR|O_TMPFILE", "mode": "0600"}),
+            &json!({"path": "/tmp", "flags": "O_RDWR|O_TMPFILE", "mode": "0600"}),
         )
         .ok();
-    assert_eq!(r.v["success"], true, "O_TMPFILE on tmpfs: {:?}", r.v);
-    let fd = r.v["return_value"].as_i64().unwrap();
-    m.invoke(&sid, "close", json!({"fd": fd})).ok();
-    let r = m.invoke(&sid, "openat", json!({"path": "x".repeat(5000)})).ok();
-    assert_eq!(r.v["errno"]["name"], "ENAMETOOLONG");
+    assert_eq!(reply.v["success"], true, "O_TMPFILE on tmpfs: {:?}", reply.v);
+    let fd = reply.v["return_value"].as_i64().unwrap();
+    mcp.invoke(sid, "close", &json!({"fd": fd})).ok();
+    let reply = mcp.invoke(sid, "openat", &json!({"path": "x".repeat(5000)})).ok();
+    assert_eq!(reply.v["errno"]["name"], "ENAMETOOLONG");
     // the request reaches the kernel verbatim
-    let r = m.invoke(&sid, "openat", json!({"path": "/proc/self/status"})).ok();
-    let issued = r.v["kernel"]["runner_issued"].as_array().unwrap();
+    let reply = mcp.invoke(sid, "openat", &json!({"path": "/proc/self/status"})).ok();
+    let issued = reply.v["kernel"]["runner_issued"].as_array().unwrap();
     assert_eq!(issued.len(), 1);
     assert_eq!(issued[0]["args"], r#"AT_FDCWD, "/proc/self/status", O_RDONLY"#);
+}
+
+/// The learner can write into the supervisor's channels (/proc/1/fd/1, 2);
+/// the host must neither break nor buffer without bound.
+fn control_channels_survive_abuse(mcp: &mut Mcp, sid: &str) {
     // writing junk into the supervisor's channel (/proc/1/fd/1) does not break the host
-    let h = m
-        .invoke(&sid, "openat", json!({"path": "/proc/1/fd/1", "flags": ["O_WRONLY"]}))
+    let host_out = mcp
+        .invoke(sid, "openat", &json!({"path": "/proc/1/fd/1", "flags": ["O_WRONLY"]}))
         .ok();
-    let h = h.v["return_value"].as_i64().unwrap();
-    m.invoke(&sid, "write", json!({"fd": h, "data": "junk\n{\"type\":\"bogus\"}\n"}))
-        .ok();
-    m.invoke(&sid, "getpid", json!({})).ok();
+    let host_out = host_out.v["return_value"].as_i64().unwrap();
+    mcp.invoke(
+        sid,
+        "write",
+        &json!({"fd": host_out, "data": "junk\n{\"type\":\"bogus\"}\n"}),
+    )
+    .ok();
+    mcp.invoke(sid, "getpid", &json!({})).ok();
     // stderr without newlines (/proc/1/fd/2 reaches the host's stderr reader)
     // and many inspect-only requests must not make anything buffer unboundedly
-    let e = m
-        .invoke(&sid, "openat", json!({"path": "/proc/1/fd/2", "flags": ["O_WRONLY"]}))
+    let host_err = mcp
+        .invoke(sid, "openat", &json!({"path": "/proc/1/fd/2", "flags": ["O_WRONLY"]}))
         .ok();
-    let e = e.v["return_value"].as_i64().unwrap();
+    let host_err = host_err.v["return_value"].as_i64().unwrap();
     for _ in 0..8 {
-        m.invoke(&sid, "write", json!({"fd": e, "data": "y".repeat(65536)}))
+        mcp.invoke(sid, "write", &json!({"fd": host_err, "data": "y".repeat(65536)}))
             .ok();
     }
     for _ in 0..50 {
-        m.tool("sandbox_inspect", json!({"session_id": sid})).ok();
+        mcp.tool("sandbox_inspect", &json!({"session_id": sid})).ok();
     }
-    m.invoke(&sid, "getpid", json!({})).ok();
+    mcp.invoke(sid, "getpid", &json!({})).ok();
+}
 
-    // container hardening as actually applied by Docker
-    let (_, hc) = docker(&["inspect", "--format", "{{json .HostConfig}}", &name]);
+/// Container hardening as actually applied by Docker.
+fn container_is_hardened(name: &str) {
+    let (_, hc) = docker(&["inspect", "--format", "{{json .HostConfig}}", name]);
     let hc: Value = serde_json::from_str(&hc).unwrap();
     assert_eq!(hc["NetworkMode"], "none");
     assert_eq!(hc["ReadonlyRootfs"], true);
@@ -669,18 +717,18 @@ fn t09_isolation() {
     assert!(hc["Memory"].as_i64().unwrap() > 0);
     assert!(hc["NanoCpus"].as_i64().unwrap() > 0);
     assert!(hc["Binds"].is_null(), "no host mounts (and no docker.sock)");
-    let (_, user) = docker(&["inspect", "--format", "{{.Config.User}}", &name]);
+    let (_, user) = docker(&["inspect", "--format", "{{.Config.User}}", name]);
     assert_eq!(user, "10001:10001");
     // inside: no capabilities, only loopback, no docker socket
-    let (_, st) = docker(&["exec", &name, "grep", "-E", "^Cap(Eff|Prm|Bnd)", "/proc/1/status"]);
+    let (_, st) = docker(&["exec", name, "grep", "-E", "^Cap(Eff|Prm|Bnd)", "/proc/1/status"]);
     assert!(st.lines().all(|l| l.ends_with("0000000000000000")), "{st}");
     // no routes at all, and every interface except loopback is down
     // (linuxkit creates inert tunnel fallback devices in each netns)
-    let (_, routes) = docker(&["exec", &name, "cat", "/proc/net/route"]);
+    let (_, routes) = docker(&["exec", name, "cat", "/proc/net/route"]);
     assert_eq!(routes.lines().count(), 1, "only the header, no routes: {routes}");
     let (_, states) = docker(&[
         "exec",
-        &name,
+        name,
         "sh",
         "-c",
         "for i in /sys/class/net/*; do echo $(basename $i) $(cat $i/operstate 2>/dev/null); done",
@@ -692,19 +740,7 @@ fn t09_isolation() {
             "interface up: {l}"
         );
     }
-    assert!(!docker(&["exec", &name, "test", "-e", "/var/run/docker.sock"]).0);
-
-    // state is discarded on destroy
-    m.invoke(
-        &sid,
-        "openat",
-        json!({"path": "secret.txt", "flags": ["O_CREAT", "O_WRONLY"], "mode": "0600"}),
-    )
-    .ok();
-    m.tool("sandbox_destroy", json!({"session_id": sid})).ok();
-    assert!(wait_gone(&name, 20));
-    m.invoke(&sid, "getpid", json!({})).err("session_not_found");
-    m.shutdown();
+    assert!(!docker(&["exec", name, "test", "-e", "/var/run/docker.sock"]).0);
 }
 
 /// Test 10: resource cleanup on server exit, crash, and orphan sweep.
@@ -713,23 +749,23 @@ fn t09_isolation() {
 fn t10_cleanup() {
     preflight();
     // graceful: stdin closed -> all sandboxes destroyed
-    let mut m = Mcp::start(&[]);
-    let a = container_of(&m.create(json!({})));
-    let b = container_of(&m.create(json!({})));
-    m.shutdown();
+    let mut mcp = Mcp::start(&[]);
+    let first = container_of(&mcp.create(&json!({})));
+    let second = container_of(&mcp.create(&json!({})));
+    mcp.shutdown();
     assert!(
-        wait_gone(&a, 20) && wait_gone(&b, 20),
+        wait_gone(&first, 20) && wait_gone(&second, 20),
         "containers removed after server exit"
     );
 
     // crash: SIGKILL the server -> container sees stdin EOF and removes itself
-    let mut m = Mcp::start(&[]);
-    let c = container_of(&m.create(json!({})));
-    let _ = m.child.kill();
-    let _ = m.child.wait();
-    assert!(wait_gone(&c, 30), "container exits when its server dies");
+    let mut mcp = Mcp::start(&[]);
+    let leftover = container_of(&mcp.create(&json!({})));
+    let _ = mcp.child.kill();
+    let _ = mcp.child.wait();
+    assert!(wait_gone(&leftover, 30), "container exits when its server dies");
 
-    // orphan sweep at start-up: a container labelled for a dead server
+    // orphan sweep at start-up: first container labelled for first dead server
     let orphan = "sacredarts-orphan-test";
     let _ = docker(&["rm", "-f", orphan]);
     let (ok, out) = docker(&[
@@ -745,15 +781,15 @@ fn t10_cleanup() {
         IMAGE,
     ]);
     assert!(ok, "{out}");
-    let m = Mcp::start(&[]);
+    let mcp = Mcp::start(&[]);
     assert!(wait_gone(orphan, 30), "orphan removed at start-up");
-    m.shutdown();
+    mcp.shutdown();
 
     // session limit
-    let mut m = Mcp::start(&[("SACREDARTS_MAX_SESSIONS", "1")]);
-    let s = m.create(json!({}));
-    m.tool("sandbox_create", json!({})).err("too_many_sessions");
-    m.tool("sandbox_destroy", json!({"session_id": s})).ok();
-    m.create(json!({}));
-    m.shutdown();
+    let mut mcp = Mcp::start(&[("SACREDARTS_MAX_SESSIONS", "1")]);
+    let sid = mcp.create(&json!({}));
+    mcp.tool("sandbox_create", &json!({})).err("too_many_sessions");
+    mcp.tool("sandbox_destroy", &json!({"session_id": sid})).ok();
+    mcp.create(&json!({}));
+    mcp.shutdown();
 }

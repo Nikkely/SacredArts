@@ -168,7 +168,7 @@ impl ObservedSyscall {
     pub fn line(&self) -> String {
         let base = format!("{}({}) = {}", self.syscall, self.args, self.return_raw);
         match self.duration_ns {
-            Some(d) => format!("{base} <{:.6}>", d as f64 / 1e9),
+            Some(d) => format!("{base} <{:.6}>", std::time::Duration::from_nanos(d).as_secs_f64()),
             None => base,
         }
     }

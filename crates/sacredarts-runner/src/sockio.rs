@@ -36,21 +36,22 @@ impl SockIo {
             if self.buf.len() > MAX_IPC_LINE_BYTES {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "IPC line too long"));
             }
-            let mut chunk = [0u8; 65536];
+            let mut chunk = vec![0u8; 65536];
             // SAFETY: `chunk` is a valid writable buffer of `chunk.len()` bytes
             // that outlives the call; `self.fd` is the socket we own.
             let n = unsafe { libc::recv(self.fd, chunk.as_mut_ptr().cast(), chunk.len(), 0) };
-            if n < 0 {
+            // A negative return is an error; anything else is a byte count.
+            let Ok(n) = usize::try_from(n) else {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 return Err(e);
-            }
+            };
             if n == 0 {
                 return Ok(None);
             }
-            self.buf.extend_from_slice(&chunk[..n as usize]);
+            self.buf.extend_from_slice(&chunk[..n]);
         }
     }
 
@@ -76,14 +77,14 @@ impl SockIo {
                     libc::MSG_NOSIGNAL,
                 )
             };
-            if n < 0 {
+            let Ok(n) = usize::try_from(n) else {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 return Err(e);
-            }
-            off += n as usize;
+            };
+            off += n;
         }
         Ok(())
     }

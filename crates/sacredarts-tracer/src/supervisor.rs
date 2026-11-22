@@ -9,11 +9,15 @@
 //! * recreates the runner on timeout / crash / policy change.
 
 use crate::parse::{TraceLine, parse_line};
-use sacredarts_core::Policy;
-use sacredarts_core::ipc::*;
+use sacredarts_core::ipc::{
+    HostMessage, InspectInfo, Observation, ObservationStatus, ObservedSyscall, RunnerHello, RunnerInfo, RunnerOp,
+    RunnerReply, RunnerReplyBody, RunnerRequest, SeccompStatus, SupervisorErrorKind, SupervisorLimits,
+    SupervisorMessage, TracingStatus, WorkspaceEntry,
+};
 use sacredarts_core::limits::{
     MAX_DIAG_LINE_BYTES, MAX_IPC_LINE_BYTES, MAX_OBSERVED_PER_REQUEST, MAX_QUEUED_TRACE_LINES, MAX_TRACE_LINE_BYTES,
 };
+use sacredarts_core::{Policy, SyscallRequest};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -104,8 +108,7 @@ fn random_u64() -> u64 {
     } else {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs() ^ u64::from(d.subsec_nanos()))
             ^ u64::from(std::process::id())
     }
 }
@@ -138,53 +141,83 @@ fn strace_version(bin: &Path) -> Option<String> {
     s.lines().next().map(|l| l.trim().to_string())
 }
 
+/// Create the strace output FIFO and a thread that queues its lines.
+fn start_trace(cfg: &Config, generation: u64) -> Result<Trace, String> {
+    // /tmp is shared with the learner, so use an unpredictable name and
+    // unlink it as soon as both ends are open.
+    let fifo = cfg
+        .tmp
+        .join(format!(".sacredarts-trace-{generation}-{:016x}.fifo", random_u64()));
+    mkfifo(&fifo).map_err(|e| format!("mkfifo {}: {e}", fifo.display()))?;
+    // Bounded: lines nobody asked for (e.g. the runner's IPC during
+    // sandbox_inspect) must not pile up.
+    let (tx, rx) = mpsc::sync_channel(MAX_QUEUED_TRACE_LINES);
+    let path = fifo.clone();
+    std::thread::spawn(move || {
+        // Blocks until strace opens the FIFO for writing.
+        match File::open(&path) {
+            Ok(f) => {
+                let _ = std::fs::remove_file(&path);
+                for line in bounded_lines(BufReader::new(f), MAX_TRACE_LINE_BYTES) {
+                    // Never block strace (and so the runner): drop when full.
+                    if let Err(TrySendError::Disconnected(_)) = tx.try_send(TraceEvent::Line(line)) {
+                        return;
+                    }
+                }
+            }
+            Err(e) => log(format!("cannot open trace fifo: {e}")),
+        }
+        let _ = tx.try_send(TraceEvent::Eof);
+    });
+    Ok(Trace { rx, fifo })
+}
+
+/// The runner command, wrapped in strace when tracing.
+fn runner_command(cfg: &Config, strace: Option<(&Path, &Trace)>) -> Command {
+    match strace {
+        Some((strace_bin, trace)) => {
+            let mut c = Command::new(strace_bin);
+            // -ttt: epoch timestamps, -T: time in syscall, -y: fd paths,
+            // -s 64: string bytes shown, -qq: no attach/exit chatter.
+            c.arg("-o")
+                .arg(&trace.fifo)
+                .args(["-ttt", "-T", "-y", "-s", "64", "-qq", "--"])
+                .arg(&cfg.runner_bin);
+            c
+        }
+        None => Command::new(&cfg.runner_bin),
+    }
+}
+
+/// Keep the last lines of the runner's stderr (and log them).
+fn tail_stderr(stderr: Option<std::process::ChildStderr>, generation: u64) -> Arc<Mutex<VecDeque<String>>> {
+    let tail = Arc::new(Mutex::new(VecDeque::new()));
+    if let Some(err) = stderr {
+        let tail = tail.clone();
+        std::thread::spawn(move || {
+            for line in bounded_lines(BufReader::new(err), MAX_DIAG_LINE_BYTES) {
+                let line = line.trim_end().to_string();
+                log(format!("runner gen{generation}: {line}"));
+                if let Ok(mut t) = tail.lock() {
+                    if t.len() >= 20 {
+                        t.pop_front();
+                    }
+                    t.push_back(line);
+                }
+            }
+        });
+    }
+    tail
+}
+
 impl RunnerProc {
     fn spawn(cfg: &Config, generation: u64, policy: &Policy, use_strace: bool) -> Result<RunnerProc, String> {
         let (ours, theirs) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
         let policy_json = serde_json::to_string(policy).map_err(|e| e.to_string())?;
-
         let strace = if use_strace { cfg.strace_bin.clone() } else { None };
-        let mut trace = None;
-        let mut cmd = match &strace {
-            Some(strace_bin) => {
-                // /tmp is shared with the learner, so use an unpredictable
-                // name and unlink it as soon as both ends are open.
-                let fifo = cfg
-                    .tmp
-                    .join(format!(".sacredarts-trace-{generation}-{:016x}.fifo", random_u64()));
-                mkfifo(&fifo).map_err(|e| format!("mkfifo {}: {e}", fifo.display()))?;
-                // Bounded: lines nobody asked for (e.g. the runner's IPC during
-                // sandbox_inspect) must not pile up.
-                let (tx, rx) = mpsc::sync_channel(MAX_QUEUED_TRACE_LINES);
-                let fifo2 = fifo.clone();
-                std::thread::spawn(move || {
-                    // Blocks until strace opens the FIFO for writing.
-                    match File::open(&fifo2) {
-                        Ok(f) => {
-                            let _ = std::fs::remove_file(&fifo2);
-                            for line in bounded_lines(BufReader::new(f), MAX_TRACE_LINE_BYTES) {
-                                // Never block strace (and so the runner): drop when full.
-                                if let Err(TrySendError::Disconnected(_)) = tx.try_send(TraceEvent::Line(line)) {
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => log(format!("cannot open trace fifo: {e}")),
-                    }
-                    let _ = tx.try_send(TraceEvent::Eof);
-                });
-                trace = Some(Trace { rx, fifo: fifo.clone() });
-                let mut c = Command::new(strace_bin);
-                // -ttt: epoch timestamps, -T: time in syscall, -y: fd paths,
-                // -s 64: string bytes shown, -qq: no attach/exit chatter.
-                c.arg("-o")
-                    .arg(&fifo)
-                    .args(["-ttt", "-T", "-y", "-s", "64", "-qq", "--"]);
-                c.arg(&cfg.runner_bin);
-                c
-            }
-            None => Command::new(&cfg.runner_bin),
-        };
+        let trace = strace.as_ref().map(|_| start_trace(cfg, generation)).transpose()?;
+
+        let mut cmd = runner_command(cfg, strace.as_deref().zip(trace.as_ref()));
         cmd.arg("--workspace")
             .arg(&cfg.workspace)
             .arg("--policy")
@@ -194,23 +227,7 @@ impl RunnerProc {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| format!("spawn runner: {e}"))?;
-
-        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
-        if let Some(err) = child.stderr.take() {
-            let tail = stderr_tail.clone();
-            std::thread::spawn(move || {
-                for line in bounded_lines(BufReader::new(err), MAX_DIAG_LINE_BYTES) {
-                    let line = line.trim_end().to_string();
-                    log(format!("runner gen{generation}: {line}"));
-                    if let Ok(mut t) = tail.lock() {
-                        if t.len() >= 20 {
-                            t.pop_front();
-                        }
-                        t.push_back(line);
-                    }
-                }
-            });
-        }
+        let stderr_tail = tail_stderr(child.stderr.take(), generation);
 
         let mut proc = RunnerProc {
             child,
@@ -235,28 +252,9 @@ impl RunnerProc {
             next_id: 1,
             stderr_tail,
         };
-
-        let hello: RunnerHello = match proc.read_line(STARTUP_TIMEOUT) {
-            Ok(l) => match serde_json::from_str(&l) {
-                Ok(h) => h,
-                Err(e) => {
-                    proc.kill();
-                    return Err(format!("bad hello from runner: {e}"));
-                }
-            },
-            Err(e) => {
-                let why = match e {
-                    ReqError::Timeout => "timed out waiting for runner".to_string(),
-                    ReqError::Crashed(m) => m,
-                };
-                std::thread::sleep(Duration::from_millis(50));
-                let tail = proc.stderr_text();
-                proc.kill();
-                return Err(format!("runner failed to start: {why}. stderr: {tail}"));
-            }
-        };
+        let hello = proc.await_hello()?;
         proc.info.pid = hello.pid;
-        proc.info.arch = hello.arch.clone();
+        proc.info.arch.clone_from(&hello.arch);
         proc.info.seccomp = read_seccomp_status(hello.pid, hello.seccomp_filter_installed);
         if let Some(s) = &strace {
             proc.info.tracing = TracingStatus::Active {
@@ -266,15 +264,36 @@ impl RunnerProc {
             proc.info.seccomp_evidence = proc.collect_startup();
         }
         RUNNER_PID.store(hello.pid, Ordering::SeqCst);
-        CHILD_PID.store(proc.child.id() as i32, Ordering::SeqCst);
+        // pids are below 2^22 on Linux
+        CHILD_PID.store(proc.child.id().cast_signed(), Ordering::SeqCst);
         Ok(proc)
+    }
+
+    /// The runner's first line. On failure the runner is killed and its
+    /// stderr is included in the error.
+    fn await_hello(&mut self) -> Result<RunnerHello, String> {
+        match self.read_line(STARTUP_TIMEOUT) {
+            Ok(l) => serde_json::from_str(&l).map_err(|e| {
+                self.kill();
+                format!("bad hello from runner: {e}")
+            }),
+            Err(e) => {
+                let why = match e {
+                    ReqError::Timeout => "timed out waiting for runner".to_string(),
+                    ReqError::Crashed(m) => m,
+                };
+                std::thread::sleep(Duration::from_millis(50));
+                let tail = self.stderr_text();
+                self.kill();
+                Err(format!("runner failed to start: {why}. stderr: {tail}"))
+            }
+        }
     }
 
     fn stderr_text(&self) -> String {
         self.stderr_tail
             .lock()
-            .map(|t| t.iter().cloned().collect::<Vec<_>>().join(" | "))
-            .unwrap_or_default()
+            .map_or_default(|t| t.iter().cloned().collect::<Vec<_>>().join(" | "))
     }
 
     /// strace lines up to the `ready` marker that document seccomp set-up.
@@ -329,7 +348,7 @@ impl RunnerProc {
         let s = serde_json::to_string(&RunnerRequest { id, op }).map_err(|e| ReqError::Crashed(e.to_string()))?;
         let mut w = &self.sock;
         w.write_all(s.as_bytes())
-            .and_then(|_| w.write_all(b"\n"))
+            .and_then(|()| w.write_all(b"\n"))
             .map_err(|e| ReqError::Crashed(format!("send to runner: {e}")))?;
         let line = self.read_line(timeout)?;
         let reply: RunnerReply =
@@ -374,7 +393,7 @@ impl RunnerProc {
                     }
                     _ => {}
                 },
-                Ok(TraceEvent::Eof) | Err(RecvTimeoutError::Disconnected) | Err(RecvTimeoutError::Timeout) => {
+                Ok(TraceEvent::Eof) | Err(RecvTimeoutError::Disconnected | RecvTimeoutError::Timeout) => {
                     return Observation {
                         status: ObservationStatus::Incomplete,
                         syscalls: out,
@@ -412,6 +431,16 @@ pub struct Supervisor {
     limits: SupervisorLimits,
     /// Once strace failed to start we stop retrying it for this container.
     strace_failure: Option<String>,
+}
+
+fn unexpected_reply(id: u64, other: &RunnerReplyBody) -> SupervisorMessage {
+    SupervisorMessage::Error {
+        id,
+        kind: SupervisorErrorKind::Internal,
+        message: format!("unexpected runner reply: {other:?}"),
+        state_reset: false,
+        runner: None,
+    }
 }
 
 fn send(msg: &SupervisorMessage) {
@@ -464,7 +493,7 @@ impl Supervisor {
 
     /// Replace a broken runner with a fresh one using the same policy.
     fn recover(&mut self, id: u64, kind: SupervisorErrorKind, message: String) -> SupervisorMessage {
-        let policy = self.runner.as_ref().map(|r| r.info.policy.clone()).unwrap_or_default();
+        let policy = self.runner.as_ref().map_or_default(|r| r.info.policy.clone());
         if let Some(mut old) = self.runner.take() {
             old.kill();
         }
@@ -490,151 +519,152 @@ impl Supervisor {
         }
     }
 
-    fn handle(&mut self, msg: HostMessage) -> Option<SupervisorMessage> {
-        let timeout = Duration::from_millis(self.limits.request_timeout_ms);
-        Some(match msg {
+    fn handle(&mut self, msg: HostMessage) -> SupervisorMessage {
+        match msg {
             HostMessage::Init { policy, limits } => {
                 self.limits = limits;
-                if self.runner.is_some() {
-                    return Some(SupervisorMessage::InitFailed {
-                        message: "already initialised".into(),
-                        kind: None,
-                    });
-                }
-                let policy = match sacredarts_policy::canonicalize(&policy) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Some(SupervisorMessage::InitFailed {
-                            message: e,
-                            kind: Some(SupervisorErrorKind::InvalidPolicy),
-                        });
-                    }
-                };
-                match self.spawn_runner(&policy) {
-                    Ok(p) => {
-                        let runner = p.info.clone();
-                        self.runner = Some(p);
-                        SupervisorMessage::Ready { runner }
-                    }
-                    Err(e) => SupervisorMessage::InitFailed { message: e, kind: None },
-                }
+                self.init(&policy)
             }
-            HostMessage::Invoke { id, request } => {
-                let Some(r) = self.runner.as_mut() else {
-                    return Some(self.recover(id, SupervisorErrorKind::RunnerCrashed, "no runner".into()));
-                };
-                match r.request(RunnerOp::Invoke { request }, timeout) {
-                    Ok((rid, RunnerReplyBody::Invoked { outcome })) => {
-                        let observation = r.observe(rid);
-                        SupervisorMessage::Invoked {
-                            id,
-                            outcome: *outcome,
-                            observation,
-                            runner_generation: r.info.generation,
-                        }
-                    }
-                    Ok((_, other)) => SupervisorMessage::Error {
-                        id,
-                        kind: SupervisorErrorKind::Internal,
-                        message: format!("unexpected runner reply: {other:?}"),
-                        state_reset: false,
-                        runner: None,
-                    },
-                    Err(ReqError::Timeout) => self.recover(
-                        id,
-                        SupervisorErrorKind::RunnerTimeout,
-                        format!(
-                            "the syscall did not complete within {} ms; the runner was killed and recreated",
-                            timeout.as_millis()
-                        ),
-                    ),
-                    Err(ReqError::Crashed(m)) => {
-                        self.recover(id, SupervisorErrorKind::RunnerCrashed, format!("runner died: {m}"))
-                    }
-                }
-            }
-            HostMessage::Inspect { id } => {
-                let Some(r) = self.runner.as_mut() else {
-                    return Some(self.recover(id, SupervisorErrorKind::RunnerCrashed, "no runner".into()));
-                };
-                match r.request(RunnerOp::ListHandles, timeout) {
-                    Ok((_, RunnerReplyBody::Handles { handles })) => {
-                        r.refresh_seccomp();
-                        SupervisorMessage::Inspected {
-                            id,
-                            info: InspectInfo {
-                                runner: r.info.clone(),
-                                handles,
-                                cwd: self.cfg.workspace.display().to_string(),
-                                workspace_entries: list_workspace(&self.cfg.workspace),
-                            },
-                        }
-                    }
-                    Ok((_, other)) => SupervisorMessage::Error {
-                        id,
-                        kind: SupervisorErrorKind::Internal,
-                        message: format!("unexpected runner reply: {other:?}"),
-                        state_reset: false,
-                        runner: None,
-                    },
-                    Err(ReqError::Timeout) => {
-                        self.recover(id, SupervisorErrorKind::RunnerTimeout, "runner did not answer".into())
-                    }
-                    Err(ReqError::Crashed(m)) => self.recover(id, SupervisorErrorKind::RunnerCrashed, m),
-                }
-            }
-            HostMessage::SetPolicy { id, policy } => {
-                // Check the policy before touching the current runner or strace.
-                // Aliases (EWOULDBLOCK) are stored by their canonical name
-                // (EAGAIN), the name the kernel's errno is reported with.
-                let policy = match sacredarts_policy::canonicalize(&policy) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Some(SupervisorMessage::Error {
-                            id,
-                            kind: SupervisorErrorKind::InvalidPolicy,
-                            message: e,
-                            state_reset: false,
-                            runner: self.runner.as_ref().map(|r| r.info.clone()),
-                        });
-                    }
-                };
-                // Start the new runner first; only switch when it is healthy.
-                match self.spawn_runner(&policy) {
-                    Ok(mut new) => match new.request(RunnerOp::Ping, timeout) {
-                        Ok((_, RunnerReplyBody::Pong)) => {
-                            if let Some(mut old) = self.runner.replace(new) {
-                                old.kill();
-                            }
-                            let runner = self.runner.as_ref().map(|r| r.info.clone())?;
-                            SupervisorMessage::PolicyApplied { id, runner }
-                        }
-                        _ => {
-                            new.kill();
-                            SupervisorMessage::Error {
-                                id,
-                                kind: SupervisorErrorKind::PolicyApplyFailed,
-                                message: "new runner failed its health check; previous runner kept".into(),
-                                state_reset: false,
-                                runner: self.runner.as_ref().map(|r| r.info.clone()),
-                            }
-                        }
-                    },
-                    Err(e) => SupervisorMessage::Error {
-                        id,
-                        kind: SupervisorErrorKind::PolicyApplyFailed,
-                        message: format!("{e}; previous runner kept"),
-                        state_reset: false,
-                        runner: self.runner.as_ref().map(|r| r.info.clone()),
-                    },
-                }
-            }
+            HostMessage::Invoke { id, request } => self.invoke(id, request),
+            HostMessage::Inspect { id } => self.inspect(id),
+            HostMessage::SetPolicy { id, policy } => self.set_policy(id, &policy),
             HostMessage::Shutdown { id } => {
                 self.shutdown();
                 send(&SupervisorMessage::ShuttingDown { id });
                 std::process::exit(0);
             }
-        })
+        }
+    }
+
+    fn timeout(&self) -> Duration {
+        Duration::from_millis(self.limits.request_timeout_ms)
+    }
+
+    fn current_runner(&self) -> Option<RunnerInfo> {
+        self.runner.as_ref().map(|r| r.info.clone())
+    }
+
+    fn init(&mut self, policy: &Policy) -> SupervisorMessage {
+        if self.runner.is_some() {
+            return SupervisorMessage::InitFailed {
+                message: "already initialised".into(),
+                kind: None,
+            };
+        }
+        let policy = match sacredarts_policy::canonicalize(policy) {
+            Ok(p) => p,
+            Err(e) => {
+                return SupervisorMessage::InitFailed {
+                    message: e,
+                    kind: Some(SupervisorErrorKind::InvalidPolicy),
+                };
+            }
+        };
+        match self.spawn_runner(&policy) {
+            Ok(p) => {
+                let runner = p.info.clone();
+                self.runner = Some(p);
+                SupervisorMessage::Ready { runner }
+            }
+            Err(e) => SupervisorMessage::InitFailed { message: e, kind: None },
+        }
+    }
+
+    fn invoke(&mut self, id: u64, request: SyscallRequest) -> SupervisorMessage {
+        let timeout = self.timeout();
+        let Some(r) = self.runner.as_mut() else {
+            return self.recover(id, SupervisorErrorKind::RunnerCrashed, "no runner".into());
+        };
+        match r.request(RunnerOp::Invoke { request }, timeout) {
+            Ok((rid, RunnerReplyBody::Invoked { outcome })) => SupervisorMessage::Invoked {
+                id,
+                outcome: *outcome,
+                observation: r.observe(rid),
+                runner_generation: r.info.generation,
+            },
+            Ok((_, other)) => unexpected_reply(id, &other),
+            Err(ReqError::Timeout) => self.recover(
+                id,
+                SupervisorErrorKind::RunnerTimeout,
+                format!(
+                    "the syscall did not complete within {} ms; the runner was killed and recreated",
+                    timeout.as_millis()
+                ),
+            ),
+            Err(ReqError::Crashed(m)) => {
+                self.recover(id, SupervisorErrorKind::RunnerCrashed, format!("runner died: {m}"))
+            }
+        }
+    }
+
+    fn inspect(&mut self, id: u64) -> SupervisorMessage {
+        let timeout = self.timeout();
+        let Some(r) = self.runner.as_mut() else {
+            return self.recover(id, SupervisorErrorKind::RunnerCrashed, "no runner".into());
+        };
+        match r.request(RunnerOp::ListHandles, timeout) {
+            Ok((_, RunnerReplyBody::Handles { handles })) => {
+                r.refresh_seccomp();
+                SupervisorMessage::Inspected {
+                    id,
+                    info: InspectInfo {
+                        runner: r.info.clone(),
+                        handles,
+                        cwd: self.cfg.workspace.display().to_string(),
+                        workspace_entries: list_workspace(&self.cfg.workspace),
+                    },
+                }
+            }
+            Ok((_, other)) => unexpected_reply(id, &other),
+            Err(ReqError::Timeout) => {
+                self.recover(id, SupervisorErrorKind::RunnerTimeout, "runner did not answer".into())
+            }
+            Err(ReqError::Crashed(m)) => self.recover(id, SupervisorErrorKind::RunnerCrashed, m),
+        }
+    }
+
+    /// Start a runner with the new policy and switch only when it is healthy;
+    /// otherwise the current runner and policy stay active.
+    fn set_policy(&mut self, id: u64, policy: &Policy) -> SupervisorMessage {
+        let failed = |this: &Self, kind, message| SupervisorMessage::Error {
+            id,
+            kind,
+            message,
+            state_reset: false,
+            runner: this.current_runner(),
+        };
+        // Aliases (EWOULDBLOCK) are stored by their canonical name (EAGAIN),
+        // the name the kernel's errno is reported with.
+        let policy = match sacredarts_policy::canonicalize(policy) {
+            Ok(p) => p,
+            Err(e) => return failed(self, SupervisorErrorKind::InvalidPolicy, e),
+        };
+        let mut new = match self.spawn_runner(&policy) {
+            Ok(new) => new,
+            Err(e) => {
+                return failed(
+                    self,
+                    SupervisorErrorKind::PolicyApplyFailed,
+                    format!("{e}; previous runner kept"),
+                );
+            }
+        };
+        if !matches!(
+            new.request(RunnerOp::Ping, self.timeout()),
+            Ok((_, RunnerReplyBody::Pong))
+        ) {
+            new.kill();
+            return failed(
+                self,
+                SupervisorErrorKind::PolicyApplyFailed,
+                "new runner failed its health check; previous runner kept".into(),
+            );
+        }
+        let runner = new.info.clone();
+        if let Some(mut old) = self.runner.replace(new) {
+            old.kill();
+        }
+        SupervisorMessage::PolicyApplied { id, runner }
     }
 
     fn shutdown(&mut self) {
@@ -691,9 +721,7 @@ impl Supervisor {
                 idle.store(limits.idle_timeout_secs, Ordering::SeqCst);
                 lifetime.store(limits.max_lifetime_secs, Ordering::SeqCst);
             }
-            if let Some(reply) = self.handle(msg) {
-                send(&reply);
-            }
+            send(&self.handle(msg));
             last_activity.store(start.elapsed().as_secs(), Ordering::SeqCst);
         }
         log("host closed the connection; shutting down");

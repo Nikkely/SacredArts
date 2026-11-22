@@ -251,7 +251,7 @@ More in [examples/prompts.md](examples/prompts.md) (Japanese).
 ## Testing
 
 ```sh
-make lint                                 # rustfmt --check and clippy (warnings are errors)
+make lint                                 # rustfmt --check and clippy incl. `pedantic` (warnings are errors; see [workspace.lints] in Cargo.toml)
 cargo test --workspace                    # macOS: unit tests for types, validation, parser, guides, event store
 scripts/linux-test.sh                     # Linux tests in Docker: runner (seccomp, paths, fds, flags) etc.
 docker build -t sacredarts-sandbox:0.1.0 .

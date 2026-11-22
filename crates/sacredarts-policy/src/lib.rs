@@ -12,7 +12,7 @@ pub use sacredarts_core::{DenyErrno, Policy, SyscallName};
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::*;
+    use super::{DenyErrno, Policy, SyscallName};
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
     use std::collections::BTreeMap;
 
@@ -72,7 +72,7 @@ mod linux {
             .map(|(_, n)| *n)
             // errno values are small positive ints; 4095 is the kernel's MAX_ERRNO.
             .or_else(|| (1..4096).find(|n| errno_name(*n).as_deref() == Some(name)))
-            .map(|n| n as u32)
+            .map(i32::cast_unsigned)
             .ok_or_else(|| format!("unknown errno name {name:?}"))
     }
 
@@ -85,7 +85,7 @@ mod linux {
     /// seccomp filter (see [`compile`]).
     pub fn canonicalize(policy: &Policy) -> Result<Policy, String> {
         let n = errno_value(&policy.errno)?;
-        let name = errno_name(n as i32).ok_or_else(|| format!("errno {n} has no name"))?;
+        let name = errno_name(n.cast_signed()).ok_or_else(|| format!("errno {n} has no name"))?;
         let canonical = Policy {
             deny: policy.deny.clone(),
             errno: DenyErrno::new(&name),
@@ -164,7 +164,7 @@ mod linux {
                     errno: DenyErrno::default(),
                 };
                 let prog = compile(&p).unwrap().unwrap();
-                assert!(!prog.is_empty());
+                assert_ne!(prog, [] as [seccompiler::sock_filter; 0]);
             }
         }
 

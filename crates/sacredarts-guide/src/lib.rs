@@ -188,11 +188,10 @@ fn fill(template: &str, v: &InvocationView<'_>) -> String {
         (
             "real_fd",
             v.handle
-                .map(|h| h.real_fd.to_string())
-                .unwrap_or_else(|| v.kernel_ret.to_string()),
+                .map_or_else(|| v.kernel_ret.to_string(), |h| h.real_fd.to_string()),
         ),
-        ("errno", v.errno.map(|e| e.name.clone()).unwrap_or_default()),
-        ("errno_message", v.errno.map(|e| e.message.clone()).unwrap_or_default()),
+        ("errno", v.errno.map_or_default(|e| e.name.clone())),
+        ("errno_message", v.errno.map_or_default(|e| e.message.clone())),
     ];
     let specific: Vec<(&str, String)> = match v.request {
         SyscallRequest::Openat {
@@ -208,7 +207,7 @@ fn fill(template: &str, v: &InvocationView<'_>) -> String {
         SyscallRequest::Read { fd, count } => {
             let note = if v.ret == 0 && *count > 0 {
                 "0 バイトはファイルの終わり（EOF）に達したことを意味します。"
-            } else if (v.ret as usize) < *count {
+            } else if usize::try_from(v.ret).is_ok_and(|n| n < *count) {
                 "要求より少ない部分読み込みです（エラーではありません）。通常ファイルでは、一般にファイルの残りがそれだけだったことを意味します。"
             } else {
                 ""
@@ -220,7 +219,7 @@ fn fill(template: &str, v: &InvocationView<'_>) -> String {
             ]
         }
         SyscallRequest::Write { fd, count, .. } => {
-            let note = if (v.ret as usize) < *count {
+            let note = if usize::try_from(v.ret).is_ok_and(|n| n < *count) {
                 "要求より少ない部分書き込みです。残りを書くには、続きのデータで write をもう一度呼びます。"
             } else {
                 ""
@@ -255,7 +254,11 @@ fn text(build: impl FnOnce(&mut String) -> std::fmt::Result) -> String {
 /// strace lines shown at every level when TraceMode::All.
 fn observed_lines(v: &InvocationView<'_>) -> Vec<String> {
     match v.observation {
-        Some(o) if o.status != ObservationStatus::Unavailable => o.syscalls.iter().map(|s| s.line()).collect(),
+        Some(o) if o.status != ObservationStatus::Unavailable => o
+            .syscalls
+            .iter()
+            .map(sacredarts_core::ipc::ObservedSyscall::line)
+            .collect(),
         _ => vec![],
     }
 }
@@ -268,11 +271,12 @@ fn level1(v: &InvocationView<'_>) -> String {
         Some(ObservationStatus::Unavailable) | None => " unavailable for this sandbox".to_string(),
         Some(st) => {
             let incomplete = (st == ObservationStatus::Incomplete).then(|| "# (observation incomplete)".to_string());
-            observed_lines(v)
-                .into_iter()
-                .chain(incomplete)
-                .map(|l| format!("\n  {l}"))
-                .collect()
+            let lines: Vec<String> = observed_lines(v).into_iter().chain(incomplete).collect();
+            if lines.is_empty() {
+                String::new()
+            } else {
+                format!("\n  {}", lines.join("\n  "))
+            }
         }
     };
     format!("{}\n# kernel (strace):{kernel}", v.requested_line)
@@ -316,10 +320,7 @@ fn arg_values(req: &SyscallRequest, v: &InvocationView<'_>) -> Vec<(String, Stri
             ("dirfd".into(), format_dirfd(*dirfd)),
             ("pathname".into(), quote_str(path)),
             ("flags".into(), format_flags(flags, *raw_flags)),
-            (
-                "mode".into(),
-                mode.map(format_mode).unwrap_or_else(|| "（指定なし）".into()),
-            ),
+            ("mode".into(), mode.map_or_else(|| "（指定なし）".into(), format_mode)),
         ],
         SyscallRequest::Read { fd, count } => vec![
             ("fd".into(), fd.to_string()),
@@ -353,146 +354,181 @@ fn purpose_label(p: IssuedPurpose) -> &'static str {
     }
 }
 
+/// Level 3: every section, with measured values separated from general rules.
 fn level3(g: &SyscallGuide, v: &InvocationView<'_>) -> String {
     text(|s| {
-        writeln!(s, "## 目的\n{}", g.purpose.trim())?;
-        writeln!(s, "\n## C の関数シグネチャ\n```c\n{}\n```", g.signature.trim())?;
-
-        let values = arg_values(v.request, v);
-        if !g.arguments.is_empty() {
-            writeln!(s, "\n## 引数（今回の値）")?;
-            for a in &g.arguments {
-                let val = values
-                    .iter()
-                    .find(|(n, _)| *n == a.name)
-                    .map(|(_, x)| x.as_str())
-                    .unwrap_or("-");
-                writeln!(s, "- `{}` ({}) = {}\n  {}", a.name, a.ty, val, a.description.trim())?;
-            }
-        }
-
-        if let SyscallRequest::Openat { flags, raw_flags, .. } = v.request {
-            writeln!(s, "\n## 使用したフラグ")?;
-            for f in flags {
-                let d = g
-                    .flags
-                    .iter()
-                    .find(|x| x.name == f.as_str())
-                    .map(|x| x.description.trim())
-                    .unwrap_or("");
-                writeln!(s, "- `{}`: {}", f.as_str(), d)?;
-            }
-            if *raw_flags != 0 {
-                writeln!(
-                    s,
-                    "- `{raw_flags:#x}`: 数値で指定されたビット（そのままカーネルに渡しました。名前付きの解釈は「発行した syscall」の行を参照）"
-                )?;
-            }
-        }
-
-        writeln!(s, "\n## 戻り値")?;
-        match (v.errno, v.request, v.handle) {
-            (None, SyscallRequest::Openat { .. }, Some(h)) => {
-                writeln!(s, "今回: `{}`（カーネルが返したファイルディスクリプタ）", h.real_fd)?;
-            }
-            (None, _, _) => {
-                writeln!(s, "今回: `{}`", v.ret)?;
-            }
-            (Some(_), _, _) => {
-                writeln!(s, "今回: `-1`")?;
-            }
-        }
-        writeln!(s, "一般: {}", g.return_value.trim())?;
-
-        writeln!(s, "\n## errno")?;
-        match v.errno {
-            Some(e) => {
-                writeln!(s, "今回: `{}` ({}) = {}", e.name, e.code, e.message)?;
-            }
-            None => {
-                writeln!(s, "今回: なし（成功）")?;
-            }
-        }
-        writeln!(s, "起こりうる主な errno:")?;
-        for e in &g.errors {
-            writeln!(s, "- `{}`: {}", e.name, e.description.trim())?;
-        }
-
-        writeln!(s, "\n## 実行による状態変化")?;
-        match (v.handle, v.request, v.errno) {
-            (Some(h), SyscallRequest::Openat { .. }, None) => {
-                writeln!(
-                    s,
-                    "今回（実測）: fd {}（{}）がプロセスの fd テーブルに追加されました。",
-                    h.real_fd, h.path
-                )?;
-            }
-            (Some(h), SyscallRequest::Close { .. }, _) => {
-                writeln!(
-                    s,
-                    "今回（実測）: fd {}（{}）がプロセスの fd テーブルから削除されました。",
-                    h.real_fd, h.path
-                )?;
-            }
-            (_, _, Some(_)) => {
-                writeln!(s, "今回（実測）: 失敗したため、fd テーブルは変化していません。")?;
-            }
-            _ => {}
-        }
-        writeln!(s, "一般:")?;
-        for c in &g.state_changes {
-            writeln!(s, "- {}", c.trim())?;
-        }
-
-        writeln!(s, "\n## 【実測】カーネルに発行された syscall")?;
-        writeln!(s, "Runner の自己申告（実 fd で表示）:")?;
-        for c in v.issued {
-            let ret = match &c.errno {
-                Some(e) => format!("-1 {e}"),
-                None => c.ret.to_string(),
-            };
-            writeln!(
-                s,
-                "  {}({}) = {}    [{}]",
-                c.syscall,
-                c.args,
-                ret,
-                purpose_label(c.purpose)
-            )?;
-        }
-        match v.observation.map(|o| o.status) {
-            Some(ObservationStatus::Complete) | Some(ObservationStatus::Incomplete) => {
-                writeln!(s, "strace による観測:")?;
-                for l in observed_lines(v) {
-                    writeln!(s, "  {l}")?;
-                }
-                if v.observation.map(|o| o.status) == Some(ObservationStatus::Incomplete) {
-                    writeln!(s, "  （観測は不完全です）")?;
-                }
-            }
-            _ => {
-                writeln!(s, "strace による観測: このサンドボックスでは利用できません。")?;
-            }
-        }
-
-        writeln!(
-            s,
-            "\n## 【一般的な仕様】関連する Linux の内部概念\n\
-         ※ 以下は Linux man-pages などに基づく一般的な説明です。SacredArts はカーネル内部（VFS 等）を直接観測していません。"
-        )?;
-        for c in &g.concepts {
-            writeln!(s, "- **{}**: {}", c.name, c.description.trim().replace('\n', " "))?;
-        }
-        if !g.notes.is_empty() || !v.notes.is_empty() {
-            writeln!(s, "\n## 補足")?;
-            for n in v.notes.iter().chain(g.notes.iter()) {
-                writeln!(s, "- {}", n.trim().replace('\n', " "))?;
-            }
-        }
-        writeln!(s, "\n## 関連する syscall\n{}", g.related.join(", "))?;
-        writeln!(s, "\n## 参考 man page\n{}", g.man_pages.join(", "))?;
+        write_arguments(s, g, v)?;
+        write_flags(s, g, v)?;
+        write_return(s, g, v)?;
+        write_errno(s, g, v)?;
+        write_state_change(s, g, v)?;
+        write_kernel_calls(s, v)?;
+        write_background(s, g, v)?;
         Ok(())
     })
+}
+
+/// Purpose, C signature and the arguments with this call's values.
+fn write_arguments(s: &mut String, g: &SyscallGuide, v: &InvocationView<'_>) -> std::fmt::Result {
+    writeln!(s, "## 目的\n{}", g.purpose.trim())?;
+    writeln!(s, "\n## C の関数シグネチャ\n```c\n{}\n```", g.signature.trim())?;
+
+    let values = arg_values(v.request, v);
+    if !g.arguments.is_empty() {
+        writeln!(s, "\n## 引数（今回の値）")?;
+        for a in &g.arguments {
+            let val = values
+                .iter()
+                .find(|(n, _)| *n == a.name)
+                .map_or("-", |(_, x)| x.as_str());
+            writeln!(s, "- `{}` ({}) = {}\n  {}", a.name, a.ty, val, a.description.trim())?;
+        }
+    }
+    Ok(())
+}
+
+/// openat: the flags that were used.
+fn write_flags(s: &mut String, g: &SyscallGuide, v: &InvocationView<'_>) -> std::fmt::Result {
+    if let SyscallRequest::Openat { flags, raw_flags, .. } = v.request {
+        writeln!(s, "\n## 使用したフラグ")?;
+        for f in flags {
+            let d = g
+                .flags
+                .iter()
+                .find(|x| x.name == f.as_str())
+                .map_or("", |x| x.description.trim());
+            writeln!(s, "- `{}`: {}", f.as_str(), d)?;
+        }
+        if *raw_flags != 0 {
+            writeln!(
+                s,
+                "- `{raw_flags:#x}`: 数値で指定されたビット（そのままカーネルに渡しました。名前付きの解釈は「発行した syscall」の行を参照）"
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// This call's return value and the general rule.
+fn write_return(s: &mut String, g: &SyscallGuide, v: &InvocationView<'_>) -> std::fmt::Result {
+    writeln!(s, "\n## 戻り値")?;
+    match (v.errno, v.request, v.handle) {
+        (None, SyscallRequest::Openat { .. }, Some(h)) => {
+            writeln!(s, "今回: `{}`（カーネルが返したファイルディスクリプタ）", h.real_fd)?;
+        }
+        (None, _, _) => {
+            writeln!(s, "今回: `{}`", v.ret)?;
+        }
+        (Some(_), _, _) => {
+            writeln!(s, "今回: `-1`")?;
+        }
+    }
+    writeln!(s, "一般: {}", g.return_value.trim())?;
+    Ok(())
+}
+
+/// This call's errno and the ones that can occur.
+fn write_errno(s: &mut String, g: &SyscallGuide, v: &InvocationView<'_>) -> std::fmt::Result {
+    writeln!(s, "\n## errno")?;
+    match v.errno {
+        Some(e) => {
+            writeln!(s, "今回: `{}` ({}) = {}", e.name, e.code, e.message)?;
+        }
+        None => {
+            writeln!(s, "今回: なし（成功）")?;
+        }
+    }
+    writeln!(s, "起こりうる主な errno:")?;
+    for e in &g.errors {
+        writeln!(s, "- `{}`: {}", e.name, e.description.trim())?;
+    }
+    Ok(())
+}
+
+/// Measured state change (fd table) and the general rule.
+fn write_state_change(s: &mut String, g: &SyscallGuide, v: &InvocationView<'_>) -> std::fmt::Result {
+    writeln!(s, "\n## 実行による状態変化")?;
+    match (v.handle, v.request, v.errno) {
+        (Some(h), SyscallRequest::Openat { .. }, None) => {
+            writeln!(
+                s,
+                "今回（実測）: fd {}（{}）がプロセスの fd テーブルに追加されました。",
+                h.real_fd, h.path
+            )?;
+        }
+        (Some(h), SyscallRequest::Close { .. }, _) => {
+            writeln!(
+                s,
+                "今回（実測）: fd {}（{}）がプロセスの fd テーブルから削除されました。",
+                h.real_fd, h.path
+            )?;
+        }
+        (_, _, Some(_)) => {
+            writeln!(s, "今回（実測）: 失敗したため、fd テーブルは変化していません。")?;
+        }
+        _ => {}
+    }
+    writeln!(s, "一般:")?;
+    for c in &g.state_changes {
+        writeln!(s, "- {}", c.trim())?;
+    }
+    Ok(())
+}
+
+/// Measured: what the runner issued and what strace observed.
+fn write_kernel_calls(s: &mut String, v: &InvocationView<'_>) -> std::fmt::Result {
+    writeln!(s, "\n## 【実測】カーネルに発行された syscall")?;
+    writeln!(s, "Runner の自己申告（実 fd で表示）:")?;
+    for c in v.issued {
+        let ret = match &c.errno {
+            Some(e) => format!("-1 {e}"),
+            None => c.ret.to_string(),
+        };
+        writeln!(
+            s,
+            "  {}({}) = {}    [{}]",
+            c.syscall,
+            c.args,
+            ret,
+            purpose_label(c.purpose)
+        )?;
+    }
+    match v.observation.map(|o| o.status) {
+        Some(ObservationStatus::Complete | ObservationStatus::Incomplete) => {
+            writeln!(s, "strace による観測:")?;
+            for l in observed_lines(v) {
+                writeln!(s, "  {l}")?;
+            }
+            if v.observation.map(|o| o.status) == Some(ObservationStatus::Incomplete) {
+                writeln!(s, "  （観測は不完全です）")?;
+            }
+        }
+        _ => {
+            writeln!(s, "strace による観測: このサンドボックスでは利用できません。")?;
+        }
+    }
+    Ok(())
+}
+
+/// General Linux background (not observed by SacredArts).
+fn write_background(s: &mut String, g: &SyscallGuide, v: &InvocationView<'_>) -> std::fmt::Result {
+    writeln!(
+        s,
+        "\n## 【一般的な仕様】関連する Linux の内部概念\n\
+     ※ 以下は Linux man-pages などに基づく一般的な説明です。SacredArts はカーネル内部（VFS 等）を直接観測していません。"
+    )?;
+    for c in &g.concepts {
+        writeln!(s, "- **{}**: {}", c.name, c.description.trim().replace('\n', " "))?;
+    }
+    if !g.notes.is_empty() || !v.notes.is_empty() {
+        writeln!(s, "\n## 補足")?;
+        for n in v.notes.iter().chain(g.notes.iter()) {
+            writeln!(s, "- {}", n.trim().replace('\n', " "))?;
+        }
+    }
+    writeln!(s, "\n## 関連する syscall\n{}", g.related.join(", "))?;
+    writeln!(s, "\n## 参考 man page\n{}", g.man_pages.join(", "))?;
+    Ok(())
 }
 
 #[must_use]

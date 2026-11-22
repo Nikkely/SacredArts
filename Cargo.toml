@@ -25,13 +25,12 @@ libc = "0.2"
 strum = { version = "0.28", features = ["derive"] }
 
 [workspace.lints.clippy]
-# Beyond the default set (CI runs clippy with -D warnings):
-# results that must not be ignored, and documented error/panic conditions,
-# so readers (people and AI agents) know how a function can fail.
-must_use_candidate = "warn"
-return_self_not_must_use = "warn"
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
+# CI runs clippy with -D warnings. On top of the default set we use the
+# whole `pedantic` group (incl. must_use, documented error/panic conditions,
+# checked numeric casts, short functions); only `doc_markdown` is off because
+# it also flags plain words such as the project name.
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
 
 [profile.release]
 lto = "thin"

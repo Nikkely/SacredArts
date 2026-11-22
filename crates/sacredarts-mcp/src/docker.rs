@@ -171,7 +171,7 @@ impl Docker {
         ]
     }
 
-    pub async fn spawn_sandbox(&self, name: &str, session_id: &str) -> Result<SupervisorConn, ToolError> {
+    pub fn spawn_sandbox(&self, name: &str, session_id: &str) -> Result<SupervisorConn, ToolError> {
         let mut child = self
             .cmd()
             .args(self.run_args(name, session_id))
@@ -270,8 +270,7 @@ impl SupervisorConn {
     pub fn stderr_text(&self) -> String {
         self.stderr_tail
             .lock()
-            .map(|t| t.iter().cloned().collect::<Vec<_>>().join("\n"))
-            .unwrap_or_default()
+            .map_or_default(|t| t.iter().cloned().collect::<Vec<_>>().join("\n"))
     }
 
     /// Turn a dead channel into the most specific error available.
@@ -326,7 +325,6 @@ impl SupervisorConn {
                     Ok(m) => return Ok(m),
                     Err(e) => {
                         tracing::warn!("ignoring malformed line from sandbox: {e}");
-                        continue;
                     }
                 },
             }

@@ -74,7 +74,7 @@ pub fn format_call(req: &SyscallRequest, read_data: Option<&[u8]>) -> String {
             format_dirfd(*dirfd),
             quote_str(path),
             format_flags(flags, *raw_flags),
-            mode.map(|m| format!(", {}", format_mode(m))).unwrap_or_default()
+            mode.map_or_default(|m| format!(", {}", format_mode(m)))
         ),
         SyscallRequest::Read { fd, count } => {
             let buf = match read_data {

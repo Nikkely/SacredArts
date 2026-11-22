@@ -97,9 +97,10 @@ pub fn decode_flags(bits: libc::c_int) -> DecodedFlags {
         }
     });
     DecodedFlags {
-        access_mode: (bits & libc::O_ACCMODE) as u32,
+        // flag words are bit patterns; reinterpret, don't convert
+        access_mode: (bits & libc::O_ACCMODE).cast_unsigned(),
         named,
-        unnamed: rest as u32,
+        unnamed: rest.cast_unsigned(),
     }
 }
 
@@ -153,7 +154,7 @@ impl Runner {
             };
         }
         let r = match req {
-            SyscallRequest::Getpid => Ok(self.getpid()),
+            SyscallRequest::Getpid => Ok(Self::getpid()),
             SyscallRequest::Openat {
                 dirfd,
                 path,
@@ -202,7 +203,7 @@ impl Runner {
         )
     }
 
-    fn getpid(&mut self) -> InvokeOutcome {
+    fn getpid() -> InvokeOutcome {
         // SAFETY: getpid takes no arguments and cannot fail.
         let r = result(unsafe { libc::syscall(libc::SYS_getpid) });
         Self::plain("getpid", String::new(), r)
@@ -249,9 +250,7 @@ impl Runner {
     ) -> Result<InvokeOutcome, Stop> {
         let (fd, shown, base) = self.dirfd(dirfd)?;
         let c = cstring(path)?;
-        let bits = flags
-            .iter()
-            .fold(raw_flags as libc::c_int, |acc, f| acc | flag_bits(*f));
+        let bits = flags.iter().fold(raw_flags.cast_signed(), |acc, f| acc | flag_bits(*f));
         // Without a mode argument C passes whatever is in the register; we pass 0.
         let m = mode.unwrap_or(0);
         // SAFETY: `c` is a valid NUL-terminated path; the kernel validates `fd`.
@@ -266,7 +265,7 @@ impl Runner {
         let args = format!("{shown}, {}, {decoded}{mode_arg}", quote_str(path));
         let issued = vec![call("openat", IssuedPurpose::Requested, args, r)];
         let opened = r.1.is_none().then(|| {
-            let label = base.map(|b| label(&b, path)).unwrap_or_else(|| path.to_string());
+            let label = base.map_or_else(|| path.to_string(), |b| label(&b, path));
             HandleChange::Opened {
                 info: self.handles.insert(r.0 as RawFd, label, decoded.to_string()),
             }
@@ -280,10 +279,9 @@ impl Runner {
         let mut buf = vec![0u8; count];
         // SAFETY: `buf` has exactly `count` writable bytes and outlives the call.
         let r = result(unsafe { libc::syscall(libc::SYS_read, fd, buf.as_mut_ptr(), count) });
-        let data = r.1.is_none().then(|| &buf[..r.0 as usize]);
-        let shown = data
-            .map(|d| quote_bytes(d, DISPLAY_BYTES))
-            .unwrap_or_else(|| "<buf>".to_string());
+        // On success the kernel returns 0..=count bytes read.
+        let data = usize::try_from(r.0).ok().filter(|_| r.1.is_none()).map(|n| &buf[..n]);
+        let shown = data.map_or_else(|| "<buf>".to_string(), |d| quote_bytes(d, DISPLAY_BYTES));
         let issued = vec![call(
             "read",
             IssuedPurpose::Requested,

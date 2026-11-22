@@ -255,7 +255,7 @@ SacredArts はパスやフラグを書き換えないので、両者は同じ sy
 ## テスト
 
 ```sh
-make lint                                 # rustfmt --check と clippy（警告はエラー扱い）
+make lint                                 # rustfmt --check と clippy（`pedantic` を含む。警告はエラー扱い。設定は Cargo.toml の [workspace.lints]）
 cargo test --workspace                    # macOS: 型・検証・パーサ・ガイド・イベントストアの単体テスト
 scripts/linux-test.sh                     # Docker 内の Linux で Runner（seccomp・パス・fd・フラグ含む）等のテスト
 docker build -t sacredarts-sandbox:0.1.0 .

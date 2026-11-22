@@ -10,7 +10,10 @@ use crate::config::Config;
 use crate::docker::{Docker, SupervisorConn};
 use crate::errors::{ErrorKind, ToolError};
 use crate::store::{self, EventKind, EventStore, SyscallEvent};
-use sacredarts_core::ipc::*;
+use sacredarts_core::ipc::{
+    HostMessage, InspectInfo, InvokeOutcome, Observation, ObservedSyscall, RunnerInfo, SupervisorErrorKind,
+    SupervisorLimits, SupervisorMessage,
+};
 use sacredarts_core::{GuideLevel, Policy, SyscallRequest, TraceMode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -47,7 +50,7 @@ impl Session {
     }
 
     pub fn idle_for(&self) -> Duration {
-        self.last_used.lock().map(|t| t.elapsed()).unwrap_or_default()
+        self.last_used.lock().map_or_default(|t| t.elapsed())
     }
 
     pub fn age(&self) -> Duration {
@@ -90,7 +93,99 @@ impl Drop for Reservation<'_> {
     }
 }
 
-fn lifecycle(event: &str, details: Value) -> SyscallEvent {
+/// The `requested` event for a request the sandbox answered.
+fn requested_event(request_id: &str, request: &SyscallRequest, args: Value, outcome: &InvokeOutcome) -> SyscallEvent {
+    use sacredarts_core::format::{format_call, format_result};
+    let (formatted, ret, errno, details) = match outcome {
+        InvokeOutcome::Completed {
+            requested_executed,
+            ret,
+            errno,
+            issued,
+            handle_change,
+            read_data_b64,
+            notes,
+            ..
+        } => {
+            let data = read_data_b64.as_deref().and_then(|b| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.decode(b).ok()
+            });
+            let line = format_call(request, data.as_deref())
+                + &format_result(*ret, errno.as_ref().map(|e| (e.name.as_str(), e.message.as_str())));
+            let details = json!({
+                "status": "completed",
+                "requested_syscall_executed": requested_executed,
+                "kernel_return_value": ret,
+                "handle_change": handle_change,
+                "runner_issued": issued,
+                "notes": notes,
+            });
+            (line, json!(ret), errno.as_ref().map(|e| e.name.clone()), details)
+        }
+        InvokeOutcome::Rejected { code, message } => (
+            format!("{} -> rejected ({code})", format_call(request, None)),
+            Value::Null,
+            None,
+            json!({ "status": "rejected", "code": code, "message": message }),
+        ),
+    };
+    SyscallEvent {
+        event_id: 0,
+        kind: EventKind::Requested,
+        source: "ai_request",
+        request_id: Some(request_id.to_string()),
+        timestamp: store::now(),
+        syscall: Some(request.name().to_string()),
+        arguments: args,
+        return_value: ret,
+        errno,
+        duration_ns: None,
+        process: None,
+        details,
+        formatted,
+    }
+}
+
+/// The `requested` event for a request whose runner failed (timeout, crash).
+fn failed_request_event(request_id: &str, request: &SyscallRequest, args: Value, code: &str) -> SyscallEvent {
+    SyscallEvent {
+        event_id: 0,
+        kind: EventKind::Requested,
+        source: "ai_request",
+        request_id: Some(request_id.to_string()),
+        timestamp: store::now(),
+        syscall: Some(request.name().to_string()),
+        arguments: args,
+        return_value: Value::Null,
+        errno: None,
+        duration_ns: None,
+        process: None,
+        details: json!({ "status": "failed", "error": code }),
+        formatted: format!("{} -> {code}", sacredarts_core::format::format_call(request, None)),
+    }
+}
+
+/// One syscall strace observed for a request.
+fn observed_event(request_id: &str, pid: i32, o: &ObservedSyscall) -> SyscallEvent {
+    SyscallEvent {
+        event_id: 0,
+        kind: EventKind::Observed,
+        source: "strace",
+        request_id: Some(request_id.to_string()),
+        timestamp: o.timestamp_epoch.and_then(store::from_epoch).unwrap_or_else(store::now),
+        syscall: Some(o.syscall.clone()),
+        arguments: json!({ "raw": o.args }),
+        return_value: json!({ "raw": o.return_raw, "value": o.ret }),
+        errno: o.errno.clone(),
+        duration_ns: o.duration_ns,
+        process: Some(json!({ "pid": pid, "role": "runner", "pid_namespace": "container" })),
+        details: json!({ "errno_message": o.errno_message, "strace_line": o.raw }),
+        formatted: o.line(),
+    }
+}
+
+fn lifecycle(event: &str, details: &Value) -> SyscallEvent {
     SyscallEvent {
         event_id: 0,
         kind: EventKind::Lifecycle,
@@ -132,7 +227,7 @@ impl Manager {
 
     fn limits(&self) -> SupervisorLimits {
         SupervisorLimits {
-            request_timeout_ms: self.cfg.request_timeout.as_millis() as u64,
+            request_timeout_ms: u64::try_from(self.cfg.request_timeout.as_millis()).unwrap_or(u64::MAX),
             // The supervisor's own watchdog is a backstop slightly behind ours.
             // u64::MAX = no limit
             idle_timeout_secs: self
@@ -160,10 +255,7 @@ impl Manager {
     }
 
     pub fn ids(&self) -> Vec<String> {
-        self.reg
-            .lock()
-            .map(|r| r.sessions.keys().cloned().collect())
-            .unwrap_or_default()
+        self.reg.lock().map_or_default(|r| r.sessions.keys().cloned().collect())
     }
 
     fn reserve(&self) -> Result<Reservation<'_>, ToolError> {
@@ -196,7 +288,7 @@ impl Manager {
         self.docker.preflight().await?;
         let id = Uuid::new_v4().to_string();
         let container = format!("sacredarts-{}", &id[..8]);
-        let mut conn = self.docker.spawn_sandbox(&container, &id).await?;
+        let mut conn = self.docker.spawn_sandbox(&container, &id)?;
         let started = async {
             conn.send(&HostMessage::Init {
                 policy: policy.clone(),
@@ -231,7 +323,7 @@ impl Manager {
         let mut events = EventStore::new(self.cfg.events_per_session);
         events.push(lifecycle(
             "sandbox_created",
-            json!({ "container": container, "image": self.cfg.image, "runner": runner_summary(&runner) }),
+            &json!({ "container": container, "image": self.cfg.image, "runner": runner_summary(&runner) }),
         ));
         let session = Arc::new(Session {
             id: id.clone(),
@@ -343,14 +435,12 @@ impl Manager {
         kind: SupervisorErrorKind,
         message: String,
         state_reset: bool,
-        runner: Option<RunnerInfo>,
+        runner: Option<&RunnerInfo>,
     ) -> ToolError {
-        if let Some(r) = runner.clone() {
-            st.runner = r;
+        if let Some(r) = runner {
+            st.runner = r.clone();
         }
-        st.events.push(lifecycle(
-            "runner_error",
-            json!({ "kind": kind, "message": message, "state_reset": state_reset, "runner": runner.as_ref().map(runner_summary) }),
+        st.events.push(lifecycle("runner_error", &json!({ "kind": kind, "message": message, "state_reset": state_reset, "runner": runner.map(runner_summary) }),
         ));
         let (ek, code) = match kind {
             SupervisorErrorKind::RunnerTimeout => (ErrorKind::Timeout, "syscall_timeout"),
@@ -365,7 +455,7 @@ impl Manager {
         }
         ToolError::new(ek, code, message).details(json!({
             "state_reset": state_reset,
-            "runner": runner.as_ref().map(runner_summary),
+            "runner": runner.map(runner_summary),
         }))
     }
 
@@ -392,116 +482,24 @@ impl Manager {
                 runner,
                 ..
             } => {
-                let e = Self::supervisor_error(&mut st, kind, message, state_reset, runner);
+                let e = Self::supervisor_error(&mut st, kind, message, state_reset, runner.as_ref());
                 // record that the AI asked for it
-                st.events.push(SyscallEvent {
-                    event_id: 0,
-                    kind: EventKind::Requested,
-                    source: "ai_request",
-                    request_id: Some(request_id.clone()),
-                    timestamp: store::now(),
-                    syscall: Some(request.name().to_string()),
-                    arguments: requested_args,
-                    return_value: Value::Null,
-                    errno: None,
-                    duration_ns: None,
-                    process: None,
-                    details: json!({ "status": "failed", "error": e.code }),
-                    formatted: format!("{} -> {}", sacredarts_core::format::format_call(&request, None), e.code),
-                });
+                st.events
+                    .push(failed_request_event(&request_id, &request, requested_args, &e.code));
                 return Err(e.with_detail("request_id", json!(request_id)));
             }
             other => return Err(ToolError::infra("ipc_failed", format!("unexpected reply: {other:?}"))),
         };
         debug_assert_eq!(generation, st.runner.generation);
 
-        // Requested event
-        let (formatted, ret, errno, details) = match &outcome {
-            InvokeOutcome::Completed {
-                requested_executed,
-                ret,
-                errno,
-                issued,
-                handle_change,
-                read_data_b64,
-                notes,
-                ..
-            } => {
-                let ai_ret = match (handle_change, errno) {
-                    (Some(HandleChange::Opened { info }), None) => info.handle as i64,
-                    _ => *ret,
-                };
-                let data = read_data_b64.as_deref().and_then(|b| {
-                    use base64::Engine;
-                    base64::engine::general_purpose::STANDARD.decode(b).ok()
-                });
-                let line = sacredarts_core::format::format_call(&request, data.as_deref())
-                    + &sacredarts_core::format::format_result(
-                        ai_ret,
-                        errno.as_ref().map(|e| (e.name.as_str(), e.message.as_str())),
-                    );
-                (
-                    line,
-                    json!(ai_ret),
-                    errno.as_ref().map(|e| e.name.clone()),
-                    json!({
-                        "status": "completed",
-                        "requested_syscall_executed": requested_executed,
-                        "kernel_return_value": ret,
-                        "handle_change": handle_change,
-                        "runner_issued": issued,
-                        "notes": notes,
-                    }),
-                )
-            }
-            InvokeOutcome::Rejected { code, message } => (
-                format!(
-                    "{} -> rejected ({code})",
-                    sacredarts_core::format::format_call(&request, None)
-                ),
-                Value::Null,
-                None,
-                json!({ "status": "rejected", "code": code, "message": message }),
-            ),
-        };
-        let event_id = st.events.push(SyscallEvent {
-            event_id: 0,
-            kind: EventKind::Requested,
-            source: "ai_request",
-            request_id: Some(request_id.clone()),
-            timestamp: store::now(),
-            syscall: Some(request.name().to_string()),
-            arguments: requested_args,
-            return_value: ret,
-            errno,
-            duration_ns: None,
-            process: None,
-            details,
-            formatted,
-        });
-
-        // Observed events (strace)
+        let event_id = st
+            .events
+            .push(requested_event(&request_id, &request, requested_args, &outcome));
         let pid = st.runner.pid;
         let observed_event_ids = observation
             .syscalls
             .iter()
-            .map(|o| {
-                st.events.push(SyscallEvent {
-                    event_id: 0,
-                    kind: EventKind::Observed,
-                    source: "strace",
-                    request_id: Some(request_id.clone()),
-                    timestamp: o.timestamp_epoch.and_then(store::from_epoch).unwrap_or_else(store::now),
-                    syscall: Some(o.syscall.clone()),
-                    arguments: json!({ "raw": o.args }),
-                    return_value: json!({ "raw": o.return_raw, "value": o.ret }),
-                    errno: o.errno.clone(),
-                    duration_ns: o.duration_ns,
-                    process: Some(json!({ "pid": pid, "role": "runner", "pid_namespace": "container" })),
-                    details: json!({ "errno_message": o.errno_message, "strace_line": o.raw }),
-                    formatted: o.line(),
-                })
-            })
+            .map(|o| st.events.push(observed_event(&request_id, pid, o)))
             .collect();
         Ok(Invoked {
             request_id,
@@ -545,7 +543,13 @@ impl Manager {
                 state_reset,
                 runner,
                 ..
-            } => Err(Self::supervisor_error(&mut st, kind, message, state_reset, runner)),
+            } => Err(Self::supervisor_error(
+                &mut st,
+                kind,
+                message,
+                state_reset,
+                runner.as_ref(),
+            )),
             other => Err(ToolError::infra("ipc_failed", format!("unexpected reply: {other:?}"))),
         }
     }
@@ -568,7 +572,7 @@ impl Manager {
                 let new_policy = st.policy.clone();
                 st.events.push(lifecycle(
                     "policy_applied",
-                    json!({
+                    &json!({
                         "old_policy": old_policy,
                         "new_policy": new_policy,
                         "state_reset": true,
@@ -585,7 +589,7 @@ impl Manager {
                 runner,
                 ..
             } => {
-                let e = Self::supervisor_error(&mut st, kind, message, state_reset, runner);
+                let e = Self::supervisor_error(&mut st, kind, message, state_reset, runner.as_ref());
                 Err(e
                     .with_detail("policy_unchanged", json!(true))
                     .with_detail("current_policy", json!(st.policy)))
@@ -615,33 +619,27 @@ impl Manager {
             st.trace_mode = t;
         }
         let new = (st.guide_level, st.trace_mode);
-        st.events.push(lifecycle(
-            "guide_changed",
-            json!({ "old": { "guide_level": old.0, "trace_mode": old.1 }, "new": { "guide_level": new.0, "trace_mode": new.1 }, "runner_recreated": false }),
+        st.events.push(lifecycle("guide_changed", &json!({ "old": { "guide_level": old.0, "trace_mode": old.1 }, "new": { "guide_level": new.0, "trace_mode": new.1 }, "runner_recreated": false }),
         ));
         Ok((st.guide_level, st.trace_mode, st.runner.clone()))
     }
 
     /// Destroy sessions that are idle or too old.
     pub async fn reap(&self) {
-        let victims: Vec<(String, &'static str)> = self
-            .reg
-            .lock()
-            .map(|r| {
-                r.sessions
-                    .values()
-                    .filter_map(|s| {
-                        if self.cfg.idle_timeout.is_some_and(|t| s.idle_for() > t) {
-                            Some((s.id.clone(), "idle timeout"))
-                        } else if self.cfg.max_lifetime.is_some_and(|t| s.age() > t) {
-                            Some((s.id.clone(), "maximum lifetime"))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let victims: Vec<(String, &'static str)> = self.reg.lock().map_or_default(|r| {
+            r.sessions
+                .values()
+                .filter_map(|s| {
+                    if self.cfg.idle_timeout.is_some_and(|t| s.idle_for() > t) {
+                        Some((s.id.clone(), "idle timeout"))
+                    } else if self.cfg.max_lifetime.is_some_and(|t| s.age() > t) {
+                        Some((s.id.clone(), "maximum lifetime"))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        });
         for (id, why) in victims {
             tracing::info!(session = %id, "destroying sandbox: {why}");
             self.destroy(&id).await;
@@ -650,12 +648,12 @@ impl Manager {
 
     /// Remove SacredArts containers whose owning MCP server process is gone.
     pub async fn cleanup_orphans(&self) -> Result<Vec<String>, ToolError> {
-        let me = std::process::id() as i32;
+        // pids are below 2^22 on Linux; the label stores them as i32
+        let me = std::process::id().cast_signed();
         let mine: Vec<String> = self
             .reg
             .lock()
-            .map(|r| r.sessions.values().map(|s| s.container.clone()).collect())
-            .unwrap_or_default();
+            .map_or_default(|r| r.sessions.values().map(|s| s.container.clone()).collect());
         let mut removed = Vec::new();
         for (name, owner) in self.docker.list_managed().await? {
             let orphan = match owner {

@@ -22,21 +22,21 @@ pub enum TraceLine {
 #[must_use]
 pub fn parse_line(line: &str) -> TraceLine {
     let line = line.trim_end_matches(['\n', '\r']);
-    let (timestamp, rest) = split_timestamp(line);
-    if rest.starts_with("---") || rest.starts_with("+++") {
+    let (timestamp, call) = split_timestamp(line);
+    if call.starts_with("---") || call.starts_with("+++") {
         return TraceLine::Other(line.to_string());
     }
-    let Some(open) = rest.find('(') else {
+    let Some(open) = call.find('(') else {
         return TraceLine::Other(line.to_string());
     };
-    let name = &rest[..open];
+    let name = &call[..open];
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return TraceLine::Other(line.to_string());
     }
-    let Some(close) = matching_paren(rest, open) else {
+    let Some(close) = matching_paren(call, open) else {
         return TraceLine::Other(line.to_string());
     };
-    let args = &rest[open + 1..close];
+    let args = &call[open + 1..close];
 
     if (name == "faccessat" || name == "faccessat2")
         && let Some(m) = parse_marker(args)
@@ -44,7 +44,7 @@ pub fn parse_line(line: &str) -> TraceLine {
         return m;
     }
 
-    let after = rest[close + 1..].trim_start();
+    let after = call[close + 1..].trim_start();
     let Some(ret_part) = after.strip_prefix('=') else {
         return TraceLine::Other(line.to_string());
     };
@@ -54,8 +54,8 @@ pub fn parse_line(line: &str) -> TraceLine {
         .strip_suffix('>')
         .and_then(|s| {
             let i = s.rfind(" <")?;
-            let secs: f64 = s[i + 2..].parse().ok()?;
-            Some((s[..i].trim_end(), Some((secs * 1e9).round() as u64)))
+            let secs = std::time::Duration::try_from_secs_f64(s[i + 2..].parse().ok()?).ok()?;
+            Some((s[..i].trim_end(), u64::try_from(secs.as_nanos()).ok()))
         })
         .unwrap_or((ret_part, None));
     let (ret, errno, errno_message, return_raw) = parse_return(ret_part);
@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(s.return_raw, "3</workspace/hello.txt>");
         assert_eq!(s.errno, None);
         assert_eq!(s.duration_ns, Some(55_000));
-        assert!((s.timestamp_epoch.unwrap() - 1795316523.562415).abs() < 1e-6);
+        assert!((s.timestamp_epoch.unwrap() - 1_795_316_523.562_415).abs() < 1e-6);
     }
 
     #[test]
@@ -225,7 +225,7 @@ mod tests {
         assert_eq!(s.syscall, "read");
         assert_eq!(s.args, r#"3</tmp/a(b\76c[d>, "x", 64"#);
         assert_eq!(s.ret, Some(1));
-        let s = sys(r#"1.0 close(3</workspace/x)y]>) = 0 <0.000002>"#);
+        let s = sys(r"1.0 close(3</workspace/x)y]>) = 0 <0.000002>");
         assert_eq!((s.syscall.as_str(), s.ret), ("close", Some(0)));
         let s = sys(r#"1.0 openat(AT_FDCWD</w(s>, "a", O_RDONLY) = 3</w(s/a> <0.000002>"#);
         assert_eq!(s.args, r#"AT_FDCWD</w(s>, "a", O_RDONLY"#);
@@ -245,7 +245,7 @@ mod tests {
         let s = sys(
             "1.0 mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0xffff8a3c0000 <0.000006>",
         );
-        assert_eq!(s.ret, Some(0xffff8a3c0000));
+        assert_eq!(s.ret, Some(0xffff_8a3c_0000));
     }
 
     #[test]

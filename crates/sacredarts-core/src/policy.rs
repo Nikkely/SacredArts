@@ -66,7 +66,7 @@ impl Policy {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let errno = errno.map(DenyErrno::new).unwrap_or_default();
+        let errno = errno.map_or_default(DenyErrno::new);
         Ok(Policy {
             deny: deny.into_iter().collect(),
             errno,

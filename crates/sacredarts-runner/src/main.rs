@@ -60,7 +60,7 @@ mod linux {
             rlim_max: 0,
         };
         // SAFETY: getrlimit writes into `lim`.
-        let top = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+        let top = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) } == 0 {
             lim.rlim_cur.min(1 << 20) as i32 - 1
         } else {
             255
@@ -95,7 +95,7 @@ mod linux {
         let mut runner = Runner::new(&cwd, ipc_fd);
         // SAFETY: getpid has no preconditions. Cached before seccomp because the
         // policy may deny getpid.
-        let pid = unsafe { libc::syscall(libc::SYS_getpid) } as i32;
+        let pid = unsafe { libc::getpid() };
         let installed = match sacredarts_policy::apply(&args.policy) {
             Ok(b) => b,
             Err(e) => {

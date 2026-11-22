@@ -104,31 +104,28 @@ pub struct SessionSetGuideParams {
 }
 
 fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
-    v.map(|x| x.to_string()).unwrap_or_else(|| "unknown".into())
+    v.map_or_else(|| "unknown".into(), |x| x.to_string())
 }
 
 fn ok(text: String, value: Value) -> CallToolResult {
+    let pretty = serde_json::to_string_pretty(&value).unwrap_or_default();
     // CallToolResult is #[non_exhaustive], so it can only be adjusted after construction.
-    let mut r = CallToolResult::structured(value.clone());
-    r.content = vec![
-        ContentBlock::text(text),
-        ContentBlock::text(serde_json::to_string_pretty(&value).unwrap_or_default()),
-    ];
+    let mut r = CallToolResult::structured(value);
+    r.content = vec![ContentBlock::text(text), ContentBlock::text(pretty)];
     r
 }
 
 fn err(e: ToolError) -> CallToolResult {
-    let v = json!({ "error": e });
     let kind = serde_json::to_value(e.kind)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default();
+    let summary = format!("Error [{kind}/{}]: {}", e.code, e.message);
+    let v = json!({ "error": serde_json::to_value(e).unwrap_or_default() });
+    let pretty = serde_json::to_string_pretty(&v).unwrap_or_default();
     // CallToolResult is #[non_exhaustive], so it can only be adjusted after construction.
-    let mut r = CallToolResult::structured_error(v.clone());
-    r.content = vec![
-        ContentBlock::text(format!("Error [{kind}/{}]: {}", e.code, e.message)),
-        ContentBlock::text(serde_json::to_string_pretty(&v).unwrap_or_default()),
-    ];
+    let mut r = CallToolResult::structured_error(v);
+    r.content = vec![ContentBlock::text(summary), ContentBlock::text(pretty)];
     r
 }
 
@@ -161,7 +158,7 @@ pub struct SacredArts {
     mgr: Arc<Manager>,
 }
 
-const INVOKE_DESCRIPTION: &str = r#"Follow the activation rule in the SacredArts server instructions It says when these tools may be used.
+const INVOKE_DESCRIPTION: &str = r#"Follow the activation rule in the SacredArts server instructions. It says when these tools may be used.
 Execute one Linux system call inside the sandbox and return the result (strace-like line, return value, errno, guide).
 State (open fds) persists between calls of the same session.
 Arguments are passed to the kernel verbatim and the kernel decides (EBADF, EMFILE, ENAMETOOLONG, EACCES, EROFS, ...):
@@ -185,7 +182,7 @@ impl SacredArts {
     }
 
     #[tool(
-        description = "Create a Linux sandbox (one Docker container) with a resident syscall runner traced by strace. Returns session_id. Options: guide_level 1-3, trace_mode requested|all, policy {deny: [...], errno}. Follow the activation rule in the SacredArts server instructions It says when these tools may be used."
+        description = "Create a Linux sandbox (one Docker container) with a resident syscall runner traced by strace. Returns session_id. Options: guide_level 1-3, trace_mode requested|all, policy {deny: [...], errno}. Follow the activation rule in the SacredArts server instructions. It says when these tools may be used."
     )]
     async fn sandbox_create(&self, params: Parameters<SandboxCreateParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
@@ -200,7 +197,7 @@ impl SacredArts {
             },
             None => Policy::default(),
         };
-        let tm: TraceMode = p.trace_mode.map(Into::into).unwrap_or_default();
+        let tm: TraceMode = p.trace_mode.map_or_default(Into::into);
         let s = match self.mgr.create(g, tm, pol).await {
             Ok(s) => s,
             Err(e) => return Ok(err(e)),
@@ -253,7 +250,7 @@ impl SacredArts {
     }
 
     #[tool(
-        description = "Describe a syscall from structured guide data (Linux man-pages based). Works without a sandbox. Includes `open` (description only) to explain open vs openat. Follow the activation rule in the SacredArts server instructions It says when these tools may be used."
+        description = "Describe a syscall from structured guide data (Linux man-pages based). Works without a sandbox. Includes `open` (description only) to explain open vs openat. Follow the activation rule in the SacredArts server instructions. It says when these tools may be used."
     )]
     async fn syscall_describe(&self, params: Parameters<SyscallDescribeParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
@@ -287,7 +284,7 @@ impl SacredArts {
     }
 
     #[tool(
-        description = "Get the session's event history in chronological order: `requested` events (what the AI asked, incl. the runner's self-reported kernel calls), `observed` events (syscalls strace actually saw), and `lifecycle` events. Paging via after_event_id / next_after_event_id. History is bounded. Follow the activation rule in the SacredArts server instructions It says when these tools may be used."
+        description = "Get the session's event history in chronological order: `requested` events (what the AI asked, incl. the runner's self-reported kernel calls), `observed` events (syscalls strace actually saw), and `lifecycle` events. Paging via after_event_id / next_after_event_id. History is bounded. Follow the activation rule in the SacredArts server instructions. It says when these tools may be used."
     )]
     async fn trace_get(&self, params: Parameters<TraceGetParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
@@ -304,32 +301,32 @@ impl SacredArts {
             Err(e) => return Ok(err(e)),
         };
         let st = s.state.lock().await;
-        let mode: TraceMode = p.trace_mode.map(Into::into).unwrap_or(st.trace_mode);
+        let mode: TraceMode = p.trace_mode.map_or(st.trace_mode, Into::into);
         let page = st
             .events
             .page(p.after_event_id.unwrap_or(0), limit as usize, mode == TraceMode::All);
-        let events: String = page
-            .events
-            .iter()
-            .map(|e| {
-                let tag = match e.kind {
-                    crate::store::EventKind::Requested => "requested",
-                    crate::store::EventKind::Observed => "observed ",
-                    crate::store::EventKind::Lifecycle => "lifecycle",
-                };
-                format!(
-                    "\n#{} {tag} {} {}",
-                    e.event_id,
-                    e.request_id.as_deref().unwrap_or("-"),
-                    e.formatted
-                )
-            })
-            .collect();
+        let header = format!("trace_mode={mode:?}, {} event(s)", page.events.len());
+        let events = page.events.iter().map(|e| {
+            let tag = match e.kind {
+                crate::store::EventKind::Requested => "requested",
+                crate::store::EventKind::Observed => "observed ",
+                crate::store::EventKind::Lifecycle => "lifecycle",
+            };
+            format!(
+                "#{} {tag} {} {}",
+                e.event_id,
+                e.request_id.as_deref().unwrap_or("-"),
+                e.formatted
+            )
+        });
         let more = page
             .next_after_event_id
-            .map(|n| format!("\n(more: call again with after_event_id={n})"))
-            .unwrap_or_default();
-        let text = format!("trace_mode={mode:?}, {} event(s){events}{more}", page.events.len());
+            .map(|n| format!("(more: call again with after_event_id={n})"));
+        let text = std::iter::once(header)
+            .chain(events)
+            .chain(more)
+            .collect::<Vec<_>>()
+            .join("\n");
         let v = json!({
             "session_id": p.session_id,
             "trace_mode": mode,
@@ -347,7 +344,7 @@ impl SacredArts {
     }
 
     #[tool(
-        description = "Replace the seccomp deny policy. The runner is recreated with the new kernel filter, so open fds are lost (state_reset: true). The switch is committed only after the new runner is healthy; on failure the old runner and policy stay active. Follow the activation rule in the SacredArts server instructions It says when these tools may be used."
+        description = "Replace the seccomp deny policy. The runner is recreated with the new kernel filter, so open fds are lost (state_reset: true). The switch is committed only after the new runner is healthy; on failure the old runner and policy stay active. Follow the activation rule in the SacredArts server instructions. It says when these tools may be used."
     )]
     async fn policy_set(&self, params: Parameters<PolicySetParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
@@ -383,7 +380,7 @@ impl SacredArts {
     }
 
     #[tool(
-        description = "Show session state: runner pid, fds opened in this session (with paths), working directory and its entries, policy and seccomp status, guide level, trace mode, event counts. Follow the activation rule in the SacredArts server instructions It says when these tools may be used."
+        description = "Show session state: runner pid, fds opened in this session (with paths), working directory and its entries, policy and seccomp status, guide level, trace mode, event counts. Follow the activation rule in the SacredArts server instructions. It says when these tools may be used."
     )]
     async fn sandbox_inspect(&self, params: Parameters<SessionParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
@@ -412,20 +409,26 @@ impl SacredArts {
                     meta["guide_level"],
                     meta["trace_mode"].as_str().unwrap_or_default(),
                 );
-                let fds: String = if info.handles.is_empty() {
-                    " (none)".to_string()
+                let header = if info.handles.is_empty() {
+                    format!("{header} (none)")
                 } else {
-                    info.handles
-                        .iter()
-                        .map(|h| format!("\n  fd {}  {}  [{}]", h.real_fd, h.path, h.flags))
-                        .collect()
+                    header
                 };
-                let entries: String = info
+                let fds = info
+                    .handles
+                    .iter()
+                    .map(|h| format!("  fd {}  {}  [{}]", h.real_fd, h.path, h.flags));
+                let entries = info
                     .workspace_entries
                     .iter()
-                    .map(|e| format!("\n  {} ({}, {} bytes)", e.name, e.kind, e.size))
-                    .collect();
-                let text = format!("{header}{fds}\n/workspace:{entries}\nevents: {}", meta["event_count"]);
+                    .map(|e| format!("  {} ({}, {} bytes)", e.name, e.kind, e.size));
+                let text = std::iter::once(header)
+                    .chain(fds)
+                    .chain(std::iter::once("/workspace:".to_string()))
+                    .chain(entries)
+                    .chain(std::iter::once(format!("events: {}", meta["event_count"])))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 Ok(ok(text, meta))
             }
             Err(e) => Ok(err(e)),
@@ -433,7 +436,7 @@ impl SacredArts {
     }
 
     #[tool(
-        description = "Destroy the sandbox: stop the runner, remove the container (its tmpfs workspace disappears with it) and forget the session. Idempotent: destroying an unknown or already destroyed session succeeds. Follow the activation rule in the SacredArts server instructions It says when these tools may be used."
+        description = "Destroy the sandbox: stop the runner, remove the container (its tmpfs workspace disappears with it) and forget the session. Idempotent: destroying an unknown or already destroyed session succeeds. Follow the activation rule in the SacredArts server instructions. It says when these tools may be used."
     )]
     async fn sandbox_destroy(&self, params: Parameters<SessionParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
@@ -450,7 +453,7 @@ impl SacredArts {
     }
 
     #[tool(
-        description = "Change the guide level (1-3) of a session, and optionally its trace mode. The runner is NOT recreated: open fds are kept. Follow the activation rule in the SacredArts server instructions It says when these tools may be used."
+        description = "Change the guide level (1-3) of a session, and optionally its trace mode. The runner is NOT recreated: open fds are kept. Follow the activation rule in the SacredArts server instructions. It says when these tools may be used."
     )]
     async fn session_set_guide(&self, params: Parameters<SessionSetGuideParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
@@ -473,6 +476,25 @@ impl SacredArts {
     }
 }
 
+/// Fields of a syscall_invoke response that only some calls have.
+fn add_optional_fields(v: &mut Value, notes: &[String], handle_change: Option<&HandleChange>, data: Option<&[u8]>) {
+    if !notes.is_empty() {
+        v["notes"] = json!(notes);
+    }
+    if let Some(change) = handle_change {
+        let (kind, h) = match change {
+            HandleChange::Opened { info } => ("opened", info),
+            HandleChange::Closed { info } => ("closed", info),
+        };
+        v["handle"] = json!({ "change": kind, "handle": h.handle, "real_fd": h.real_fd, "path": h.path });
+    }
+    if let Some(d) = data {
+        v["data_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(d));
+        v["data_text"] = std::str::from_utf8(d).map_or(Value::Null, |s| json!(s));
+        v["bytes_read"] = json!(d.len());
+    }
+}
+
 fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallToolResult {
     let Invoked {
         request_id,
@@ -486,11 +508,8 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
         policy,
     } = inv;
     match &outcome {
-        InvokeOutcome::Rejected { code, message } => {
-            err(ToolError::new(ErrorKind::InvalidArgument, code, message.clone()).details(
-                json!({ "event_id": event_id, "request_id": request_id, "note": "rejected by SacredArts before any syscall was issued" }),
-            ))
-        }
+        InvokeOutcome::Rejected { code, message } => err(ToolError::new(ErrorKind::InvalidArgument, code, message.clone())
+            .details(json!({ "event_id": event_id, "request_id": request_id, "note": "rejected by SacredArts before any syscall was issued" }))),
         InvokeOutcome::Completed {
             requested_executed,
             ret,
@@ -505,12 +524,8 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
                 .as_deref()
                 .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok());
             let handle = match handle_change {
-                Some(HandleChange::Opened { info }) | Some(HandleChange::Closed { info }) => Some(info),
+                Some(HandleChange::Opened { info } | HandleChange::Closed { info }) => Some(info),
                 None => None,
-            };
-            let ai_ret = match (handle_change, errno) {
-                (Some(HandleChange::Opened { info }), None) => info.handle as i64,
-                _ => *ret,
             };
             let name = req.name();
             let denied_by_policy = *requested_executed
@@ -518,14 +533,14 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
                 && errno.as_ref().is_some_and(|e| e.name == policy.errno.as_str());
             let line = sacredarts_core::format::format_call(req, data.as_deref())
                 + &sacredarts_core::format::format_result(
-                    ai_ret,
+                    *ret,
                     errno.as_ref().map(|e| (e.name.as_str(), e.message.as_str())),
                 );
             let view = InvocationView {
                 request: req,
                 requested_line: line.clone(),
                 executed: *requested_executed,
-                ret: ai_ret,
+                ret: *ret,
                 kernel_ret: *ret,
                 errno: errno.as_ref(),
                 handle,
@@ -545,7 +560,7 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
                 "syscall": name,
                 "success": errno.is_none(),
                 "requested_syscall_executed": requested_executed,
-                "return_value": ai_ret,
+                "return_value": ret,
                 "errno": errno,
                 "formatted": line,
                 "denied_by_policy": denied_by_policy,
@@ -563,25 +578,7 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
                     "truncated": observation.truncated,
                 },
             });
-            if !notes.is_empty() {
-                v["notes"] = json!(notes);
-            }
-            if let Some(h) = handle {
-                v["handle"] = json!({
-                    "change": if matches!(handle_change, Some(HandleChange::Opened { .. })) { "opened" } else { "closed" },
-                    "handle": h.handle,
-                    "real_fd": h.real_fd,
-                    "path": h.path,
-                });
-            }
-            if let Some(d) = &data {
-                v["data_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(d));
-                v["data_text"] = match std::str::from_utf8(d) {
-                    Ok(s) => json!(s),
-                    Err(_) => Value::Null,
-                };
-                v["bytes_read"] = json!(d.len());
-            }
+            add_optional_fields(&mut v, notes, handle_change.as_ref(), data.as_deref());
             if trace_mode == TraceMode::All && observation.status != ObservationStatus::Unavailable {
                 v["observation"]["syscalls"] =
                     json!(observation.syscalls.iter().map(|s| s.raw.clone()).collect::<Vec<_>>());
@@ -591,6 +588,10 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
     }
 }
 
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "the async trait methods are generated by rmcp's #[tool_handler]"
+)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SacredArts {
     fn get_info(&self) -> ServerConfig {

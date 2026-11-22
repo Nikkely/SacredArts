@@ -55,10 +55,9 @@ pub fn now() -> String {
 
 /// strace `-ttt` epoch seconds -> RFC 3339.
 pub fn from_epoch(t: f64) -> Option<String> {
-    let secs = t.floor() as i64;
-    let nanos = ((t - t.floor()) * 1e9).round() as u32;
-    DateTime::<Utc>::from_timestamp(secs, nanos.min(999_999_999))
-        .map(|d| d.to_rfc3339_opts(SecondsFormat::Micros, true))
+    let d = std::time::Duration::try_from_secs_f64(t).ok()?;
+    let secs = i64::try_from(d.as_secs()).ok()?;
+    DateTime::<Utc>::from_timestamp(secs, d.subsec_nanos()).map(|d| d.to_rfc3339_opts(SecondsFormat::Micros, true))
 }
 
 pub struct Page {
