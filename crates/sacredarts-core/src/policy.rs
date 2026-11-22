@@ -3,6 +3,7 @@
 use crate::request::ValidationError;
 use crate::syscall::SyscallName;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use strum::VariantNames;
 
 /// errno returned by the kernel when a denied syscall is attempted, by name
@@ -42,24 +43,27 @@ impl Policy {
     /// Build a policy from untrusted user input. Unknown names are rejected,
     /// duplicates removed, and the list sorted for a stable representation.
     pub fn from_user(deny: &[String], errno: Option<&str>) -> Result<Self, ValidationError> {
-        let mut out = Vec::new();
-        for name in deny {
-            let n = name.parse::<SyscallName>().map_err(|_| {
-                ValidationError::new(
-                    "unsupported_syscall",
-                    format!(
-                        "cannot deny {name:?}: policies may only list the MVP learning syscalls ({})",
-                        SyscallName::VARIANTS.join(", ")
-                    ),
-                )
-                .field("deny")
-            })?;
-            out.push(n);
-        }
-        out.sort();
-        out.dedup();
+        // A BTreeSet removes duplicates and sorts in one step.
+        let deny: BTreeSet<SyscallName> = deny
+            .iter()
+            .map(|name| {
+                name.parse().map_err(|_| {
+                    ValidationError::new(
+                        "unsupported_syscall",
+                        format!(
+                            "cannot deny {name:?}: policies may only list the MVP learning syscalls ({})",
+                            SyscallName::VARIANTS.join(", ")
+                        ),
+                    )
+                    .field("deny")
+                })
+            })
+            .collect::<Result<_, _>>()?;
         let errno = errno.map(DenyErrno::new).unwrap_or_default();
-        Ok(Policy { deny: out, errno })
+        Ok(Policy {
+            deny: deny.into_iter().collect(),
+            errno,
+        })
     }
 
     pub fn is_empty(&self) -> bool {

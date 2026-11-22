@@ -44,6 +44,12 @@ impl ToolError {
         self
     }
 
+    /// Add one field to `details`, creating the object if needed.
+    pub fn with_detail(mut self, key: &str, value: Value) -> Self {
+        self.details.get_or_insert_with(|| serde_json::json!({}))[key] = value;
+        self
+    }
+
     pub fn infra(code: &str, message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Infrastructure, code, message)
     }
@@ -64,11 +70,10 @@ impl ToolError {
             "limit_exceeded" => ErrorKind::LimitExceeded,
             _ => ErrorKind::InvalidArgument,
         };
-        let mut e = Self::new(kind, &v.code, v.message);
-        if let Some(f) = v.field {
-            e.details = Some(serde_json::json!({ "field": f }));
+        Self {
+            details: v.field.map(|f| serde_json::json!({ "field": f })),
+            ..Self::new(kind, &v.code, v.message)
         }
-        e
     }
 }
 

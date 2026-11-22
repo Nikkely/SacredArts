@@ -69,8 +69,6 @@ pub struct ErrnoInfo {
 pub enum IssuedPurpose {
     /// The syscall the AI asked for, with its arguments passed verbatim.
     Requested,
-    /// Internal cleanup (`close_range`) of temporary descriptors.
-    Cleanup,
     /// Internal state check (e.g. `fcntl(F_GETFD)` after a failed close).
     StateCheck,
 }
@@ -152,6 +150,17 @@ pub struct ObservedSyscall {
     pub duration_ns: Option<u64>,
     /// The unmodified strace line.
     pub raw: String,
+}
+
+impl ObservedSyscall {
+    /// strace-like line without the timestamp, e.g. `read(3</a>, "x", 4) = 1 <0.000004>`.
+    pub fn line(&self) -> String {
+        let base = format!("{}({}) = {}", self.syscall, self.args, self.return_raw);
+        match self.duration_ns {
+            Some(d) => format!("{base} <{:.6}>", d as f64 / 1e9),
+            None => base,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

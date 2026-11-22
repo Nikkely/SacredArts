@@ -325,10 +325,13 @@ impl Manager {
             Err(e) => {
                 tracing::warn!(session = %s.id, "sandbox failure: {e}");
                 self.bury(s, st, &e).await;
-                let mut e = e;
-                e.message
-                    .push_str(" (the sandbox was destroyed; create a new one with sandbox_create)");
-                Err(e)
+                Err(ToolError {
+                    message: format!(
+                        "{} (the sandbox was destroyed; create a new one with sandbox_create)",
+                        e.message
+                    ),
+                    ..e
+                })
             }
         }
     }
@@ -388,7 +391,7 @@ impl Manager {
                 runner,
                 ..
             } => {
-                let mut e = Self::supervisor_error(&mut st, kind, message, state_reset, runner);
+                let e = Self::supervisor_error(&mut st, kind, message, state_reset, runner);
                 // record that the AI asked for it
                 st.events.push(SyscallEvent {
                     event_id: 0,
@@ -405,10 +408,7 @@ impl Manager {
                     details: json!({ "status": "failed", "error": e.code }),
                     formatted: format!("{} -> {}", sacredarts_core::format::format_call(&request, None), e.code),
                 });
-                if let Some(d) = e.details.as_mut() {
-                    d["request_id"] = json!(request_id);
-                }
-                return Err(e);
+                return Err(e.with_detail("request_id", json!(request_id)));
             }
             other => return Err(ToolError::infra("ipc_failed", format!("unexpected reply: {other:?}"))),
         };
@@ -480,29 +480,27 @@ impl Manager {
 
         // Observed events (strace)
         let pid = st.runner.pid;
-        let mut observed_event_ids = Vec::new();
-        for o in &observation.syscalls {
-            let mut line = format!("{}({}) = {}", o.syscall, o.args, o.return_raw);
-            if let Some(d) = o.duration_ns {
-                line.push_str(&format!(" <{:.6}>", d as f64 / 1e9));
-            }
-            let eid = st.events.push(SyscallEvent {
-                event_id: 0,
-                kind: EventKind::Observed,
-                source: "strace",
-                request_id: Some(request_id.clone()),
-                timestamp: o.timestamp_epoch.and_then(store::from_epoch).unwrap_or_else(store::now),
-                syscall: Some(o.syscall.clone()),
-                arguments: json!({ "raw": o.args }),
-                return_value: json!({ "raw": o.return_raw, "value": o.ret }),
-                errno: o.errno.clone(),
-                duration_ns: o.duration_ns,
-                process: Some(json!({ "pid": pid, "role": "runner", "pid_namespace": "container" })),
-                details: json!({ "errno_message": o.errno_message, "strace_line": o.raw }),
-                formatted: line,
-            });
-            observed_event_ids.push(eid);
-        }
+        let observed_event_ids = observation
+            .syscalls
+            .iter()
+            .map(|o| {
+                st.events.push(SyscallEvent {
+                    event_id: 0,
+                    kind: EventKind::Observed,
+                    source: "strace",
+                    request_id: Some(request_id.clone()),
+                    timestamp: o.timestamp_epoch.and_then(store::from_epoch).unwrap_or_else(store::now),
+                    syscall: Some(o.syscall.clone()),
+                    arguments: json!({ "raw": o.args }),
+                    return_value: json!({ "raw": o.return_raw, "value": o.ret }),
+                    errno: o.errno.clone(),
+                    duration_ns: o.duration_ns,
+                    process: Some(json!({ "pid": pid, "role": "runner", "pid_namespace": "container" })),
+                    details: json!({ "errno_message": o.errno_message, "strace_line": o.raw }),
+                    formatted: o.line(),
+                })
+            })
+            .collect();
         Ok(Invoked {
             request_id,
             event_id,
@@ -584,12 +582,10 @@ impl Manager {
                 runner,
                 ..
             } => {
-                let mut e = Self::supervisor_error(&mut st, kind, message, state_reset, runner);
-                if let Some(d) = e.details.as_mut() {
-                    d["policy_unchanged"] = json!(true);
-                    d["current_policy"] = json!(st.policy);
-                }
-                Err(e)
+                let e = Self::supervisor_error(&mut st, kind, message, state_reset, runner);
+                Err(e
+                    .with_detail("policy_unchanged", json!(true))
+                    .with_detail("current_policy", json!(st.policy)))
             }
             other => Err(ToolError::infra("ipc_failed", format!("unexpected reply: {other:?}"))),
         }

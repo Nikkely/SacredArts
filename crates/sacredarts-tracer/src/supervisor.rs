@@ -270,24 +270,27 @@ impl RunnerProc {
     fn collect_startup(&mut self) -> Vec<ObservedSyscall> {
         let Some(trace) = &self.trace else { return vec![] };
         let deadline = Instant::now() + OBSERVE_TIMEOUT;
-        let mut evidence = Vec::new();
-        for _ in 0..MAX_STARTUP_LINES {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match trace.rx.recv_timeout(left) {
-                Ok(TraceEvent::Line(l)) => match parse_line(&l) {
-                    TraceLine::Marker { kind, .. } if kind == "ready" => break,
-                    TraceLine::Syscall(s)
-                        if s.syscall == "seccomp"
-                            || (s.syscall == "prctl" && s.args.contains("PR_SET_NO_NEW_PRIVS")) =>
-                    {
-                        evidence.push(s)
-                    }
-                    _ => {}
-                },
-                _ => break,
+        let lines = std::iter::from_fn(|| {
+            match trace
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(TraceEvent::Line(l)) => Some(parse_line(&l)),
+                _ => None,
             }
-        }
-        evidence
+        });
+        lines
+            .take(MAX_STARTUP_LINES)
+            .take_while(|t| !matches!(t, TraceLine::Marker { kind, .. } if kind == "ready"))
+            .filter_map(|t| match t {
+                TraceLine::Syscall(s)
+                    if s.syscall == "seccomp" || (s.syscall == "prctl" && s.args.contains("PR_SET_NO_NEW_PRIVS")) =>
+                {
+                    Some(s)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn read_line(&mut self, timeout: Duration) -> Result<String, ReqError> {

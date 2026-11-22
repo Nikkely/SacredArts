@@ -73,14 +73,16 @@ pub struct Guides {
 
 impl Guides {
     pub fn parse_builtin() -> Result<Guides, String> {
-        let mut map = BTreeMap::new();
-        for (file, text) in BUILTIN {
-            let g: SyscallGuide = serde_yaml_ng::from_str(text).map_err(|e| format!("guides/{file}.yaml: {e}"))?;
-            if g.name != *file {
-                return Err(format!("guides/{file}.yaml declares name {:?}", g.name));
-            }
-            map.insert(g.name.clone(), g);
-        }
+        let map = BUILTIN
+            .iter()
+            .map(|(file, text)| {
+                let g: SyscallGuide = serde_yaml_ng::from_str(text).map_err(|e| format!("guides/{file}.yaml: {e}"))?;
+                if g.name != *file {
+                    return Err(format!("guides/{file}.yaml declares name {:?}", g.name));
+                }
+                Ok((g.name.clone(), g))
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Guides { map })
     }
 
@@ -153,27 +155,27 @@ fn access_ja(flags: &[OpenFlag], raw: u32) -> String {
             _ => "読み込み専用で利用できる",
         }
     };
-    let mut pre = String::new();
-    if flags.contains(&OpenFlag::O_CREAT) {
-        pre.push_str(if flags.contains(&OpenFlag::O_EXCL) {
-            "新規作成し、"
-        } else {
-            "作成またはオープンし、"
-        });
+    let has = |f| flags.contains(&f);
+    let open = match (has(OpenFlag::O_CREAT), has(OpenFlag::O_EXCL)) {
+        (true, true) => "新規作成し、",
+        (true, false) => "作成またはオープンし、",
+        (false, _) => "オープンし、",
+    };
+    let trunc = if has(OpenFlag::O_TRUNC) {
+        "中身を空にして、"
     } else {
-        pre.push_str("オープンし、");
-    }
-    if flags.contains(&OpenFlag::O_TRUNC) {
-        pre.push_str("中身を空にして、");
-    }
-    if flags.contains(&OpenFlag::O_APPEND) {
-        pre.push_str("追記モードで、");
-    }
-    format!("{pre}{mode}")
+        ""
+    };
+    let append = if has(OpenFlag::O_APPEND) {
+        "追記モードで、"
+    } else {
+        ""
+    };
+    format!("{open}{trunc}{append}{mode}")
 }
 
 fn fill(template: &str, v: &InvocationView<'_>) -> String {
-    let mut vars: Vec<(&str, String)> = vec![
+    let common = [
         ("ret", v.ret.to_string()),
         (
             "real_fd",
@@ -184,47 +186,48 @@ fn fill(template: &str, v: &InvocationView<'_>) -> String {
         ("errno", v.errno.map(|e| e.name.clone()).unwrap_or_default()),
         ("errno_message", v.errno.map(|e| e.message.clone()).unwrap_or_default()),
     ];
-    match v.request {
+    let specific: Vec<(&str, String)> = match v.request {
         SyscallRequest::Openat {
             path, flags, raw_flags, ..
-        } => {
-            vars.push(("path", path.clone()));
-            vars.push(("flags_ja", access_ja(flags, *raw_flags)));
-        }
-        SyscallRequest::Mkdirat { path, mode, .. } => {
-            vars.push(("path", path.clone()));
-            vars.push(("mode", format_mode(*mode)));
-        }
+        } => vec![("path", path.clone()), ("flags_ja", access_ja(flags, *raw_flags))],
+        SyscallRequest::Mkdirat { path, mode, .. } => vec![("path", path.clone()), ("mode", format_mode(*mode))],
         SyscallRequest::Read { fd, count } => {
-            vars.push(("fd", fd.to_string()));
-            vars.push(("count", count.to_string()));
             let note = if v.ret == 0 && *count > 0 {
-                "0 バイトはファイルの終わり（EOF）に達したことを意味します。".to_string()
+                "0 バイトはファイルの終わり（EOF）に達したことを意味します。"
             } else if (v.ret as usize) < *count {
-                "要求より少ない部分読み込みです（エラーではありません）。通常ファイルでは、一般にファイルの残りがそれだけだったことを意味します。".to_string()
+                "要求より少ない部分読み込みです（エラーではありません）。通常ファイルでは、一般にファイルの残りがそれだけだったことを意味します。"
             } else {
-                String::new()
+                ""
             };
-            vars.push(("eof_note", note));
+            vec![
+                ("fd", fd.to_string()),
+                ("count", count.to_string()),
+                ("eof_note", note.to_string()),
+            ]
         }
         SyscallRequest::Write { fd, count, .. } => {
-            vars.push(("fd", fd.to_string()));
-            vars.push(("count", count.to_string()));
             let note = if (v.ret as usize) < *count {
-                "要求より少ない部分書き込みです。残りを書くには、続きのデータで write をもう一度呼びます。".to_string()
+                "要求より少ない部分書き込みです。残りを書くには、続きのデータで write をもう一度呼びます。"
             } else {
-                String::new()
+                ""
             };
-            vars.push(("partial_note", note));
+            vec![
+                ("fd", fd.to_string()),
+                ("count", count.to_string()),
+                ("partial_note", note.to_string()),
+            ]
         }
-        SyscallRequest::Close { fd } => vars.push(("fd", fd.to_string())),
-        SyscallRequest::Getpid => {}
-    }
-    let mut out = template.to_string();
-    for (k, val) in vars {
-        out = out.replace(&format!("{{{k}}}"), &val);
-    }
-    out.trim().to_string()
+        SyscallRequest::Close { fd } => vec![("fd", fd.to_string())],
+        SyscallRequest::Getpid => vec![],
+    };
+    common
+        .into_iter()
+        .chain(specific)
+        .fold(template.to_string(), |out, (k, val)| {
+            out.replace(&format!("{{{k}}}"), &val)
+        })
+        .trim()
+        .to_string()
 }
 
 /// Build text with `writeln!(s, ..)?`. Writing to a `String` cannot fail,
@@ -238,41 +241,27 @@ fn text(build: impl FnOnce(&mut String) -> std::fmt::Result) -> String {
 /// strace lines shown at every level when TraceMode::All.
 fn observed_lines(v: &InvocationView<'_>) -> Vec<String> {
     match v.observation {
-        Some(o) if o.status != ObservationStatus::Unavailable => o
-            .syscalls
-            .iter()
-            .map(|s| {
-                let line = format!("{}({}) = {}", s.syscall, s.args, s.return_raw);
-                match s.duration_ns {
-                    Some(d) => format!("{line} <{:.6}>", d as f64 / 1e9),
-                    None => line,
-                }
-            })
-            .collect(),
+        Some(o) if o.status != ObservationStatus::Unavailable => o.syscalls.iter().map(|s| s.line()).collect(),
         _ => vec![],
     }
 }
 
 fn level1(v: &InvocationView<'_>) -> String {
-    let mut s = v.requested_line.clone();
-    if v.trace_mode == TraceMode::All {
-        match v.observation.map(|o| o.status) {
-            Some(ObservationStatus::Unavailable) | None => {
-                s.push_str("\n# kernel (strace): unavailable for this sandbox");
-            }
-            Some(st) => {
-                s.push_str("\n# kernel (strace):");
-                for l in observed_lines(v) {
-                    s.push_str("\n  ");
-                    s.push_str(&l);
-                }
-                if st == ObservationStatus::Incomplete {
-                    s.push_str("\n  # (observation incomplete)");
-                }
-            }
-        }
+    if v.trace_mode != TraceMode::All {
+        return v.requested_line.clone();
     }
-    s
+    let kernel = match v.observation.map(|o| o.status) {
+        Some(ObservationStatus::Unavailable) | None => " unavailable for this sandbox".to_string(),
+        Some(st) => {
+            let incomplete = (st == ObservationStatus::Incomplete).then(|| "# (observation incomplete)".to_string());
+            observed_lines(v)
+                .into_iter()
+                .chain(incomplete)
+                .map(|l| format!("\n  {l}"))
+                .collect()
+        }
+    };
+    format!("{}\n# kernel (strace):{kernel}", v.requested_line)
 }
 
 fn explanation(g: &SyscallGuide, v: &InvocationView<'_>) -> String {
@@ -346,7 +335,6 @@ fn arg_values(req: &SyscallRequest, v: &InvocationView<'_>) -> Vec<(String, Stri
 fn purpose_label(p: IssuedPurpose) -> &'static str {
     match p {
         IssuedPurpose::Requested => "要求された操作",
-        IssuedPurpose::Cleanup => "内部: 後片付け",
         IssuedPurpose::StateCheck => "内部: 状態確認",
     }
 }
@@ -513,11 +501,11 @@ pub fn render_invocation(guides: &Guides, level: GuideLevel, v: &InvocationView<
         },
         GuideLevel::Explained | GuideLevel::Detailed => {
             let exp = explanation(g, v);
-            let mut text = format!("{l1}\n\n解説:\n{exp}");
-            if level == GuideLevel::Detailed {
-                text.push_str("\n\n");
-                text.push_str(&level3(g, v));
-            }
+            let details = match level {
+                GuideLevel::Detailed => format!("\n\n{}", level3(g, v)),
+                _ => String::new(),
+            };
+            let text = format!("{l1}\n\n解説:\n{exp}{details}");
             Rendered {
                 level: level.as_u8(),
                 summary: g.summary.clone(),

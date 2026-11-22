@@ -59,6 +59,8 @@ impl Docker {
         Docker { cfg }
     }
 
+    /// `Command`'s builder methods take `&mut self`, so the command is
+    /// configured in place.
     fn cmd(&self) -> Command {
         let mut c = Command::new(&self.cfg.docker_bin);
         c.stdin(Stdio::null())
@@ -69,9 +71,7 @@ impl Docker {
     }
 
     async fn run(&self, args: &[&str], timeout: Duration) -> Result<String, ToolError> {
-        let mut c = self.cmd();
-        c.args(args);
-        let out = match tokio::time::timeout(timeout, c.output()).await {
+        let out = match tokio::time::timeout(timeout, self.cmd().args(args).output()).await {
             Err(_) => {
                 return Err(ToolError::infra(
                     "docker_timeout",
@@ -121,7 +121,7 @@ impl Docker {
         let tmpfs = |path: &str| {
             format!("{path}:rw,nosuid,nodev,noexec,size=16m,uid={SANDBOX_UID},gid={SANDBOX_UID},mode=0700")
         };
-        let mut a: Vec<String> = vec![
+        vec![
             "run".into(),
             "-i".into(), // stdin/stdout = IPC with the supervisor; no ports are published
             "--rm".into(),
@@ -167,15 +167,15 @@ impl Docker {
             "--log-driver".into(),
             "none".into(),
             "--init".into(),
-        ];
-        a.push(self.cfg.image.clone());
-        a
+            self.cfg.image.clone(),
+        ]
     }
 
     pub async fn spawn_sandbox(&self, name: &str, session_id: &str) -> Result<SupervisorConn, ToolError> {
-        let mut c = self.cmd();
-        c.args(self.run_args(name, session_id)).stdin(Stdio::piped());
-        let mut child = c
+        let mut child = self
+            .cmd()
+            .args(self.run_args(name, session_id))
+            .stdin(Stdio::piped())
             .spawn()
             .map_err(|e| ToolError::infra("docker_unavailable", format!("cannot execute docker CLI: {e}")))?;
         let stdin = child
@@ -268,11 +268,12 @@ impl SupervisorConn {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let stderr = self.stderr_text();
         if !stderr.trim().is_empty() && !stderr.contains("[sacredarts-supervisor]") {
-            let mut e = classify(&stderr, &self.image);
-            if e.code == "docker_error" {
-                e = ToolError::infra("sandbox_terminated", format!("{what}; docker: {}", stderr.trim()));
-            }
-            return e;
+            return match classify(&stderr, &self.image) {
+                e if e.code == "docker_error" => {
+                    ToolError::infra("sandbox_terminated", format!("{what}; docker: {}", stderr.trim()))
+                }
+                e => e,
+            };
         }
         ToolError::infra(
             "sandbox_terminated",
@@ -282,9 +283,8 @@ impl SupervisorConn {
     }
 
     pub async fn send(&mut self, msg: &HostMessage) -> Result<(), ToolError> {
-        let mut s = serde_json::to_string(msg).map_err(|e| ToolError::infra("ipc_failed", e.to_string()))?;
-        s.push('\n');
-        if let Err(e) = self.stdin.write_all(s.as_bytes()).await {
+        let json = serde_json::to_string(msg).map_err(|e| ToolError::infra("ipc_failed", e.to_string()))?;
+        if let Err(e) = self.stdin.write_all(format!("{json}\n").as_bytes()).await {
             return Err(self.dead(&format!("writing to the sandbox failed: {e}")).await);
         }
         if let Err(e) = self.stdin.flush().await {

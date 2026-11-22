@@ -371,6 +371,22 @@ fn t06_strace_observation() {
         )
         .ok();
     assert!(t2.v["events"][0]["event_id"].as_u64().unwrap() > cursor);
+    // brackets in a file name appear unescaped in strace's fd annotations;
+    // the write must still be observed
+    let o = m
+        .invoke(
+            &sid,
+            "openat",
+            json!({"path": "a(b>c[d", "flags": "O_WRONLY|O_CREAT", "mode": "0644"}),
+        )
+        .ok();
+    let fd = o.v["return_value"].as_i64().unwrap();
+    let w = m.invoke(&sid, "write", json!({"fd": fd, "data": "x"})).ok();
+    let syscalls = w.v["observation"]["syscalls"].as_array().unwrap();
+    assert!(
+        syscalls.iter().any(|l| l.as_str().unwrap().contains("write(")),
+        "{syscalls:?}"
+    );
     m.tool("sandbox_destroy", json!({"session_id": sid})).ok();
     m.shutdown();
 }

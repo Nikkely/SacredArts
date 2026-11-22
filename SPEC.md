@@ -49,7 +49,7 @@
 | 項目 | 元の仕様 | 実装 | 理由 |
 |---|---|---|---|
 | プロジェクト名 | SacredCall | **SacredArts**（crate `sacredarts-*`、バイナリ `sacredarts`、イメージ `sacredarts-sandbox`、環境変数 `SACREDARTS_*`、ラベル `io.sacredarts.*`） | プロジェクトオーナーの意向 |
-| 起動の規則 | （なし） | 「System Call」/「システムコール」等の呪文があるときだけツールを使うよう、MCP の instructions とツール説明で AI に指示（`SACREDARTS_ACTIVATION=always` で無効化） | 無関係な会話での誤作動を防ぐため（プロジェクトオーナーの要望）。サーバーはユーザー発言を受け取れないので強制はできない |
+| 起動の規則 | （なし） | 「System Call」/「システムコール」等の呪文があるときだけツールを使うよう、MCP の instructions で AI に指示し、各ツール説明は「instructions の規則に従う」とだけ書く（`SACREDARTS_ACTIVATION=always` で無効化したとき矛盾しないように） | 無関係な会話での誤作動を防ぐため（プロジェクトオーナーの要望）。サーバーはユーザー発言を受け取れないので強制はできない |
 | crate 構成 | `sacredarts-runtime` を含む 6 crate | `runtime` の代わりに `sacredarts-core`（共有型）。Docker/セッション管理は `sacredarts-mcp` 内のモジュール。Supervisor は `sacredarts-tracer` のバイナリ | 不要な分割を避けつつ、Linux 専用部分とホスト部分を分離するため。仕様で許可された範囲の変更 |
 | Phase の順序 | 2（MCP）→ 3（Guide）→ 4（Observation） | Supervisor を Phase 2 の時点で strace 付きで実装 | ホスト⇔コンテナの IPC と strace の起動は同じ Supervisor が担うため、作り直しを避けた |
 | fd 番号 | （仮想ハンドルなら明示） | **仮想ハンドルは使わず、本物の fd。** Runner は IPC ソケットを fd 上限近く（通常 255）へ移し、fd 0 を `/dev/null` にする | 番号の付き方・`EBADF`・`EMFILE` をカーネルの本物の挙動として見せるため。IPC ソケットだけは `reserved_fd` で守る（閉じるとセッションが切れるため） |

@@ -7,24 +7,22 @@ pub const DISPLAY_BYTES: usize = 32;
 
 /// C-style quoted and escaped byte string, truncated like strace (`"abc"...`).
 pub fn quote_bytes(data: &[u8], max: usize) -> String {
-    let mut s = String::from("\"");
-    for &b in data.iter().take(max) {
-        match b {
-            b'"' => s.push_str("\\\""),
-            b'\\' => s.push_str("\\\\"),
-            b'\n' => s.push_str("\\n"),
-            b'\t' => s.push_str("\\t"),
-            b'\r' => s.push_str("\\r"),
-            0 => s.push_str("\\0"),
-            0x20..=0x7e => s.push(b as char),
-            _ => s.push_str(&format!("\\x{b:02x}")),
-        }
-    }
-    s.push('"');
-    if data.len() > max {
-        s.push_str("...");
-    }
-    s
+    let body: String = data
+        .iter()
+        .take(max)
+        .map(|&b| match b {
+            b'"' => "\\\"".to_string(),
+            b'\\' => "\\\\".to_string(),
+            b'\n' => "\\n".to_string(),
+            b'\t' => "\\t".to_string(),
+            b'\r' => "\\r".to_string(),
+            0 => "\\0".to_string(),
+            0x20..=0x7e => (b as char).to_string(),
+            _ => format!("\\x{b:02x}"),
+        })
+        .collect();
+    let more = if data.len() > max { "..." } else { "" };
+    format!("\"{body}\"{more}")
 }
 
 pub fn quote_str(s: &str) -> String {
@@ -40,11 +38,13 @@ pub fn format_dirfd(d: Dirfd) -> String {
 
 /// Named flags followed by any numeric bits (`O_RDWR|0x200000`).
 pub fn format_flags(flags: &[OpenFlag], raw: u32) -> String {
-    let mut parts: Vec<String> = flags.iter().map(|f| f.as_str().to_string()).collect();
-    if raw != 0 || parts.is_empty() {
-        parts.push(format!("{raw:#x}"));
-    }
-    parts.join("|")
+    let bits = (raw != 0 || flags.is_empty()).then(|| format!("{raw:#x}"));
+    flags
+        .iter()
+        .map(|f| f.as_str().to_string())
+        .chain(bits)
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// Octal with a leading 0, like strace (`0644`, `04755`, `0000`).
@@ -63,19 +63,13 @@ pub fn format_call(req: &SyscallRequest, read_data: Option<&[u8]>) -> String {
             flags,
             raw_flags,
             mode,
-        } => {
-            let mut s = format!(
-                "openat({}, {}, {}",
-                format_dirfd(*dirfd),
-                quote_str(path),
-                format_flags(flags, *raw_flags)
-            );
-            if let Some(m) = mode {
-                s.push_str(&format!(", {}", format_mode(*m)));
-            }
-            s.push(')');
-            s
-        }
+        } => format!(
+            "openat({}, {}, {}{})",
+            format_dirfd(*dirfd),
+            quote_str(path),
+            format_flags(flags, *raw_flags),
+            mode.map(|m| format!(", {}", format_mode(m))).unwrap_or_default()
+        ),
         SyscallRequest::Read { fd, count } => {
             let buf = match read_data {
                 Some(d) => quote_bytes(d, DISPLAY_BYTES),

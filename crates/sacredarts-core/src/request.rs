@@ -366,66 +366,74 @@ fn bad_flags(msg: impl Into<String>) -> ValidationError {
     ValidationError::new("invalid_flags", msg).field("flags")
 }
 
-/// One `|`-separated token: a flag name or a C integer literal.
-fn flag_token(t: &str, names: &mut Vec<OpenFlag>, raw: &mut u32) -> Result<(), ValidationError> {
-    let t = t.trim();
-    if t.is_empty() {
-        return Ok(());
-    }
-    if let Ok(f) = t.parse::<OpenFlag>() {
-        if !names.contains(&f) {
-            names.push(f);
-        }
-        return Ok(());
-    }
-    let n = parse_c_int(t).and_then(|n| u32::try_from(n).ok()).ok_or_else(|| {
-        bad_flags(format!(
-            "unknown flag {t:?}; use O_* names ({}) or numbers like 0x80000",
-            OpenFlag::VARIANTS.join(" ")
-        ))
-    })?;
-    *raw |= n;
-    Ok(())
+/// One piece of the `flags` argument.
+enum FlagPart {
+    Name(OpenFlag),
+    Bits(u32),
 }
 
-fn flag_number(n: &serde_json::Number, raw: &mut u32) -> Result<(), ValidationError> {
-    *raw |= flag_bits_from_number(n).ok_or_else(|| bad_flags("flags must fit in a C int"))?;
-    Ok(())
+/// One `|`-separated token: a flag name or a C integer literal.
+fn flag_token(t: &str) -> Result<FlagPart, ValidationError> {
+    if let Ok(f) = t.parse::<OpenFlag>() {
+        return Ok(FlagPart::Name(f));
+    }
+    parse_c_int(t)
+        .and_then(|n| u32::try_from(n).ok())
+        .map(FlagPart::Bits)
+        .ok_or_else(|| {
+            bad_flags(format!(
+                "unknown flag {t:?}; use O_* names ({}) or numbers like 0x80000",
+                OpenFlag::VARIANTS.join(" ")
+            ))
+        })
+}
+
+fn flag_parts(v: &Value) -> Result<Vec<FlagPart>, ValidationError> {
+    match v {
+        Value::String(s) => s
+            .split('|')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(flag_token)
+            .collect(),
+        Value::Number(n) => flag_bits_from_number(n)
+            .map(|b| vec![FlagPart::Bits(b)])
+            .ok_or_else(|| bad_flags("flags must fit in a C int")),
+        _ => Err(bad_flags("flags must be names like \"O_CREAT\" or numbers")),
+    }
 }
 
 /// Flags may be names, numbers, or a mix (`"O_RDWR|0x200000"`, `[2, "O_CREAT"]`, `66`).
 fn parse_flags(v: Option<&Value>) -> Result<(Vec<OpenFlag>, u32), ValidationError> {
-    let mut names = Vec::new();
-    let mut raw: u32 = 0;
-    match v {
-        None | Some(Value::Null) => {}
-        Some(Value::Number(n)) => flag_number(n, &mut raw)?,
-        Some(Value::String(s)) => {
-            for t in s.split('|') {
-                flag_token(t, &mut names, &mut raw)?;
-            }
-        }
-        Some(Value::Array(a)) => {
-            for x in a {
-                match x {
-                    Value::String(s) => {
-                        for t in s.split('|') {
-                            flag_token(t, &mut names, &mut raw)?;
-                        }
-                    }
-                    Value::Number(n) => flag_number(n, &mut raw)?,
-                    _ => return Err(bad_flags("flags must be names like \"O_CREAT\" or numbers")),
-                }
-            }
-        }
+    let parts: Vec<FlagPart> = match v {
+        None | Some(Value::Null) => vec![],
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(flag_parts)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect(),
+        Some(x @ (Value::String(_) | Value::Number(_))) => flag_parts(x)?,
         _ => return Err(bad_flags("flags must be an array, a \"O_A|O_B\" string or a number")),
-    }
+    };
+    let raw = parts.iter().fold(0, |acc, p| match p {
+        FlagPart::Bits(b) => acc | b,
+        FlagPart::Name(_) => acc,
+    });
+    let given: Vec<OpenFlag> = parts
+        .iter()
+        .filter_map(|p| match p {
+            FlagPart::Name(f) => Some(*f),
+            FlagPart::Bits(_) => None,
+        })
+        .collect();
     // O_RDONLY is 0, so "no access mode" means read-only, exactly as in C.
-    if !names.iter().any(|f| f.is_access_mode()) && raw & O_ACCMODE == 0 {
-        names.push(OpenFlag::O_RDONLY);
-    }
-    let out = OpenFlag::iter().filter(|f| names.contains(f)).collect();
-    Ok((out, raw))
+    let implicit_rdonly = !given.iter().any(|f| f.is_access_mode()) && raw & O_ACCMODE == 0;
+    let names = OpenFlag::iter()
+        .filter(|f| given.contains(f) || (implicit_rdonly && *f == OpenFlag::O_RDONLY))
+        .collect();
+    Ok((names, raw))
 }
 
 /// `mode_t` is passed verbatim (including setuid/setgid/sticky bits); the

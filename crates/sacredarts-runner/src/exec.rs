@@ -81,28 +81,29 @@ fn flag_bits(f: OpenFlag) -> libc::c_int {
 /// named bits (multi-bit flags such as O_TMPFILE and O_SYNC first), then any
 /// remaining bits in hex.
 pub fn decode_flags(bits: libc::c_int) -> String {
-    let mut parts = vec![match bits & libc::O_ACCMODE {
+    let access = match bits & libc::O_ACCMODE {
         libc::O_RDONLY => "O_RDONLY".to_string(),
         libc::O_WRONLY => "O_WRONLY".to_string(),
         libc::O_RDWR => "O_RDWR".to_string(),
         m => format!("{m:#x}"),
-    }];
-    let mut rest = bits & !libc::O_ACCMODE;
+    };
     // Multi-bit flags (O_TMPFILE, O_SYNC) first; an alias (O_NDELAY, O_RSYNC)
     // never matches because its canonical name comes first and clears the bits.
-    let mut named: Vec<OpenFlag> = OpenFlag::iter().filter(|f| !f.is_access_mode()).collect();
-    named.sort_by_key(|f| std::cmp::Reverse(flag_bits(*f).count_ones()));
-    for f in named {
+    let named = || OpenFlag::iter().filter(|f| !f.is_access_mode());
+    let multi_bit_first = named()
+        .filter(|f| flag_bits(*f).count_ones() > 1)
+        .chain(named().filter(|f| flag_bits(*f).count_ones() <= 1));
+    let (names, rest) = multi_bit_first.fold((vec![access], bits & !libc::O_ACCMODE), |(mut names, rest), f| {
         let v = flag_bits(f);
         if v != 0 && rest & v == v {
-            parts.push(f.as_str().to_string());
-            rest &= !v;
+            names.push(f.as_str().to_string());
+            (names, rest & !v)
+        } else {
+            (names, rest)
         }
-    }
-    if rest != 0 {
-        parts.push(format!("{rest:#x}"));
-    }
-    parts.join("|")
+    });
+    let unnamed = (rest != 0).then(|| format!("{rest:#x}"));
+    names.into_iter().chain(unnamed).collect::<Vec<_>>().join("|")
 }
 
 /// Convert a raw `syscall(2)` return into (ret, errno).
@@ -152,57 +153,52 @@ impl Runner {
                 message: v.message,
             };
         }
-        let mut issued = Vec::new();
         let r = match req {
-            SyscallRequest::Getpid => Ok(self.getpid(&mut issued)),
+            SyscallRequest::Getpid => Ok(self.getpid()),
             SyscallRequest::Openat {
                 dirfd,
                 path,
                 flags,
                 raw_flags,
                 mode,
-            } => self.openat(*dirfd, path, flags, *raw_flags, *mode, &mut issued),
-            SyscallRequest::Read { fd, count } => self.read(*fd, *count, &mut issued),
-            SyscallRequest::Write { fd, data, count } => self.write(*fd, &data[..*count], &mut issued),
-            SyscallRequest::Close { fd } => self.close(*fd, &mut issued),
-            SyscallRequest::Mkdirat { dirfd, path, mode } => self.mkdirat(*dirfd, path, *mode, &mut issued),
+            } => self.openat(*dirfd, path, flags, *raw_flags, *mode),
+            SyscallRequest::Read { fd, count } => self.read(*fd, *count),
+            SyscallRequest::Write { fd, data, count } => self.write(*fd, &data[..*count]),
+            SyscallRequest::Close { fd } => self.close(*fd),
+            SyscallRequest::Mkdirat { dirfd, path, mode } => self.mkdirat(*dirfd, path, *mode),
         };
-        match r {
-            Ok(c) => c,
-            Err(v) => InvokeOutcome::Rejected {
-                code: v.code,
-                message: v.message,
-            },
-        }
+        r.unwrap_or_else(|v| InvokeOutcome::Rejected {
+            code: v.code,
+            message: v.message,
+        })
     }
 
-    fn completed(ret: (i64, Option<i32>), issued: Vec<IssuedCall>) -> InvokeOutcome {
+    fn completed(
+        ret: (i64, Option<i32>),
+        issued: Vec<IssuedCall>,
+        handle_change: Option<HandleChange>,
+        read_data: Option<&[u8]>,
+    ) -> InvokeOutcome {
         InvokeOutcome::Completed {
             requested_executed: true,
             ret: ret.0,
             errno: ret.1.map(errno::info),
             issued,
-            handle_change: None,
-            read_data_b64: None,
+            handle_change,
+            read_data_b64: read_data.map(|d| base64::engine::general_purpose::STANDARD.encode(d)),
             notes: vec![],
         }
     }
 
-    fn issue(issued: &mut Vec<IssuedCall>, syscall: &str, purpose: IssuedPurpose, args: String, r: (i64, Option<i32>)) {
-        issued.push(IssuedCall {
-            syscall: syscall.to_string(),
-            purpose,
-            args,
-            ret: r.0,
-            errno: r.1.map(errno::name),
-        });
+    /// The single requested call, with nothing else to report.
+    fn plain(syscall: &str, args: String, r: (i64, Option<i32>)) -> InvokeOutcome {
+        Self::completed(r, vec![call(syscall, IssuedPurpose::Requested, args, r)], None, None)
     }
 
-    fn getpid(&mut self, issued: &mut Vec<IssuedCall>) -> InvokeOutcome {
+    fn getpid(&mut self) -> InvokeOutcome {
         // SAFETY: getpid takes no arguments and cannot fail.
         let r = result(unsafe { libc::syscall(libc::SYS_getpid) });
-        Self::issue(issued, "getpid", IssuedPurpose::Requested, String::new(), r);
-        Self::completed(r, std::mem::take(issued))
+        Self::plain("getpid", String::new(), r)
     }
 
     /// Any fd goes to the kernel, except the runner's IPC socket: using it
@@ -243,7 +239,6 @@ impl Runner {
         flags: &[OpenFlag],
         raw_flags: u32,
         mode: Option<u32>,
-        issued: &mut Vec<IssuedCall>,
     ) -> Result<InvokeOutcome, Stop> {
         let (fd, shown, base) = self.dirfd(dirfd)?;
         let c = cstring(path)?;
@@ -255,122 +250,101 @@ impl Runner {
         // SAFETY: `c` is a valid NUL-terminated path; the kernel validates `fd`.
         let r = result(unsafe { libc::syscall(libc::SYS_openat, fd, c.as_ptr(), bits, m as libc::c_uint) });
         let decoded = decode_flags(bits);
-        let mut args = format!("{shown}, {}, {decoded}", quote_str(path));
         let uses_mode = bits & libc::O_CREAT != 0 || bits & libc::O_TMPFILE == libc::O_TMPFILE;
-        if mode.is_some() || uses_mode {
-            args.push_str(&format!(", {}", format_mode(m)));
-        }
-        Self::issue(issued, "openat", IssuedPurpose::Requested, args, r);
-
-        let mut out = Self::completed(r, std::mem::take(issued));
-        if r.1.is_none() {
-            let new_fd = r.0 as RawFd;
-            let label = match base {
-                Some(b) => label(&b, path),
-                None => path.to_string(),
-            };
-            let info = self.handles.insert(new_fd, label, decoded);
-            if let InvokeOutcome::Completed { handle_change, .. } = &mut out {
-                *handle_change = Some(HandleChange::Opened { info });
+        let mode_arg = if mode.is_some() || uses_mode {
+            format!(", {}", format_mode(m))
+        } else {
+            String::new()
+        };
+        let args = format!("{shown}, {}, {decoded}{mode_arg}", quote_str(path));
+        let issued = vec![call("openat", IssuedPurpose::Requested, args, r)];
+        let opened = r.1.is_none().then(|| {
+            let label = base.map(|b| label(&b, path)).unwrap_or_else(|| path.to_string());
+            HandleChange::Opened {
+                info: self.handles.insert(r.0 as RawFd, label, decoded),
             }
-        }
-        Ok(out)
+        });
+        Ok(Self::completed(r, issued, opened, None))
     }
 
-    fn read(&mut self, fd: i32, count: usize, issued: &mut Vec<IssuedCall>) -> Result<InvokeOutcome, Stop> {
+    fn read(&mut self, fd: i32, count: usize) -> Result<InvokeOutcome, Stop> {
         let (fd, shown_fd) = self.fd(fd)?;
+        // The kernel writes into this buffer, so it has to be mutable.
         let mut buf = vec![0u8; count];
         // SAFETY: `buf` has exactly `count` writable bytes and outlives the call.
         let r = result(unsafe { libc::syscall(libc::SYS_read, fd, buf.as_mut_ptr(), count) });
-        let shown = if r.1.is_none() {
-            quote_bytes(&buf[..r.0 as usize], DISPLAY_BYTES)
-        } else {
-            "<buf>".to_string()
-        };
-        Self::issue(
-            issued,
+        let data = r.1.is_none().then(|| &buf[..r.0 as usize]);
+        let shown = data
+            .map(|d| quote_bytes(d, DISPLAY_BYTES))
+            .unwrap_or_else(|| "<buf>".to_string());
+        let issued = vec![call(
             "read",
             IssuedPurpose::Requested,
             format!("{shown_fd}, {shown}, {count}"),
             r,
-        );
-        let mut out = Self::completed(r, std::mem::take(issued));
-        if r.1.is_none()
-            && let InvokeOutcome::Completed { read_data_b64, .. } = &mut out
-        {
-            *read_data_b64 = Some(base64::engine::general_purpose::STANDARD.encode(&buf[..r.0 as usize]));
-        }
-        Ok(out)
+        )];
+        Ok(Self::completed(r, issued, None, data))
     }
 
-    fn write(&mut self, fd: i32, data: &[u8], issued: &mut Vec<IssuedCall>) -> Result<InvokeOutcome, Stop> {
+    fn write(&mut self, fd: i32, data: &[u8]) -> Result<InvokeOutcome, Stop> {
         let (fd, shown_fd) = self.fd(fd)?;
         // SAFETY: `data` is a valid readable slice for the duration of the call.
         let r = result(unsafe { libc::syscall(libc::SYS_write, fd, data.as_ptr(), data.len()) });
-        Self::issue(
-            issued,
+        // A short write is reported as-is; the runner never loops to "fix" it.
+        Ok(Self::plain(
             "write",
-            IssuedPurpose::Requested,
             format!("{shown_fd}, {}, {}", quote_bytes(data, DISPLAY_BYTES), data.len()),
             r,
-        );
-        // A short write is reported as-is; the runner never loops to "fix" it.
-        Ok(Self::completed(r, std::mem::take(issued)))
+        ))
     }
 
-    fn close(&mut self, fd: i32, issued: &mut Vec<IssuedCall>) -> Result<InvokeOutcome, Stop> {
+    fn close(&mut self, fd: i32) -> Result<InvokeOutcome, Stop> {
         let (fd, shown) = self.fd(fd)?;
         // SAFETY: closing an fd is memory-safe; the runner's own IPC socket is excluded above.
         let r = result(unsafe { libc::syscall(libc::SYS_close, fd) });
-        Self::issue(issued, "close", IssuedPurpose::Requested, shown, r);
-        let gone = if r.1.is_none() {
-            true
+        let requested = call("close", IssuedPurpose::Requested, shown, r);
+        let (gone, probe) = if r.1.is_none() {
+            (true, None)
         } else if self.handles.get(fd).is_none() {
-            false
+            (false, None)
         } else {
             // On Linux close() releases the fd even when it reports an error,
             // except when the syscall never ran (e.g. denied by seccomp).
             // Ask the kernel instead of guessing.
             // SAFETY: F_GETFD only queries descriptor flags.
-            let probe = result(unsafe { libc::syscall(libc::SYS_fcntl, fd, libc::F_GETFD) });
-            Self::issue(
-                issued,
-                "fcntl",
-                IssuedPurpose::StateCheck,
-                format!("{fd}, F_GETFD"),
-                probe,
-            );
-            probe.1 == Some(libc::EBADF)
+            let p = result(unsafe { libc::syscall(libc::SYS_fcntl, fd, libc::F_GETFD) });
+            let probe = call("fcntl", IssuedPurpose::StateCheck, format!("{fd}, F_GETFD"), p);
+            (p.1 == Some(libc::EBADF), Some(probe))
         };
-        let mut out = Self::completed(r, std::mem::take(issued));
-        if gone
-            && let Some(info) = self.handles.remove(fd)
-            && let InvokeOutcome::Completed { handle_change, .. } = &mut out
-        {
-            *handle_change = Some(HandleChange::Closed { info });
-        }
-        Ok(out)
+        let issued = std::iter::once(requested).chain(probe).collect();
+        let closed = gone
+            .then(|| self.handles.remove(fd))
+            .flatten()
+            .map(|info| HandleChange::Closed { info });
+        Ok(Self::completed(r, issued, closed, None))
     }
 
-    fn mkdirat(
-        &mut self,
-        dirfd: Dirfd,
-        path: &str,
-        mode: u32,
-        issued: &mut Vec<IssuedCall>,
-    ) -> Result<InvokeOutcome, Stop> {
+    fn mkdirat(&mut self, dirfd: Dirfd, path: &str, mode: u32) -> Result<InvokeOutcome, Stop> {
         let (fd, shown, _) = self.dirfd(dirfd)?;
         let c = cstring(path)?;
         // SAFETY: `c` is a valid NUL-terminated path; the kernel validates `fd`.
         let r = result(unsafe { libc::syscall(libc::SYS_mkdirat, fd, c.as_ptr(), mode as libc::c_uint) });
-        Self::issue(
-            issued,
+        Ok(Self::plain(
             "mkdirat",
-            IssuedPurpose::Requested,
             format!("{shown}, {}, {}", quote_str(path), format_mode(mode)),
             r,
-        );
-        Ok(Self::completed(r, std::mem::take(issued)))
+        ))
+    }
+}
+
+/// One syscall the runner issued, as reported back to the host.
+fn call(syscall: &str, purpose: IssuedPurpose, args: String, r: (i64, Option<i32>)) -> IssuedCall {
+    IssuedCall {
+        syscall: syscall.to_string(),
+        purpose,
+        args,
+        ret: r.0,
+        errno: r.1.map(errno::name),
     }
 }
 

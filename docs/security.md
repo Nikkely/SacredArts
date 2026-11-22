@@ -78,8 +78,8 @@ docker run -i --rm --pull never --name sacredarts-<id>
 ## 4. seccomp ポリシー（学習用の制御）
 
 - deny できるのは MVP の 6 syscall のみ。フィルタは「既定は許可、指定番号は `SECCOMP_RET_ERRNO`」。
-- Runner は初期化（`/workspace` の dirfd を開く、PID の取得）を終えてからフィルタを適用します。フィルタは不可逆なので、ポリシー変更は Runner の再作成で行います。
-- Runner の内部通信（`sendto`/`recvfrom`）、後片付け（`close_range`）、状態確認（`fcntl`）、境界マーカー（`faccessat`）、メモリ管理、終了処理は deny 対象にならない syscall なので、どのポリシーでも Runner は動き続けます。
+- Runner は初期化（IPC ソケットの移動、PID の取得）を終えてからフィルタを適用します。フィルタは不可逆なので、ポリシー変更は Runner の再作成で行います。
+- Runner の内部通信（`sendto`/`recvfrom`）、状態確認（`fcntl`）、境界マーカー（`faccessat`）、メモリ管理、終了処理は deny 対象にならない syscall なので、どのポリシーでも Runner は動き続けます。
 - seccomp による拒否であることの確認方法:
   1. strace にその syscall が `= -1 EPERM` として現れる（アプリ側の条件分岐なら syscall 自体が出ない）。
   2. Runner 起動時の strace に `seccomp(SECCOMP_SET_MODE_FILTER, ...)` が記録されている（`seccomp_evidence`）。

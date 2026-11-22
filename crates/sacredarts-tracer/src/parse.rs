@@ -47,17 +47,16 @@ pub fn parse_line(line: &str) -> TraceLine {
     let Some(ret_part) = after.strip_prefix('=') else {
         return TraceLine::Other(line.to_string());
     };
-    let mut ret_part = ret_part.trim();
-    let mut duration_ns = None;
-    if ret_part.ends_with('>')
-        && let Some(i) = ret_part.rfind(" <")
-    {
-        let inner = &ret_part[i + 2..ret_part.len() - 1];
-        if let Ok(secs) = inner.parse::<f64>() {
-            duration_ns = Some((secs * 1e9).round() as u64);
-            ret_part = ret_part[..i].trim_end();
-        }
-    }
+    // `... = 3 <0.000012>`: the trailing `<seconds>` comes from `strace -T`.
+    let ret_part = ret_part.trim();
+    let (ret_part, duration_ns) = ret_part
+        .strip_suffix('>')
+        .and_then(|s| {
+            let i = s.rfind(" <")?;
+            let secs: f64 = s[i + 2..].parse().ok()?;
+            Some((s[..i].trim_end(), Some((secs * 1e9).round() as u64)))
+        })
+        .unwrap_or((ret_part, None));
     let (ret, errno, errno_message, return_raw) = parse_return(ret_part);
     TraceLine::Syscall(ObservedSyscall {
         timestamp_epoch: timestamp,
@@ -83,33 +82,41 @@ fn split_timestamp(line: &str) -> (Option<f64>, &str) {
     (None, line)
 }
 
-/// Index of the `)` matching the `(` at `open`, skipping quoted strings
-/// (strace escapes `"` inside strings as `\"`) and nested brackets.
+/// Where the scanner is inside an strace argument list.
+#[derive(Clone, Copy, PartialEq)]
+enum Scan {
+    Code,
+    /// Inside `"..."`; strace escapes `"` as `\"`.
+    Str,
+    /// Inside a `-y` path annotation such as `3</workspace/a(b>`. strace
+    /// escapes `>` in the path (as `\76`) but not brackets, so brackets here
+    /// must not count as nesting.
+    Annotation,
+}
+
+/// Index of the `)` matching the `(` at `open`, skipping quoted strings,
+/// fd path annotations and nested brackets.
 fn matching_paren(s: &str, open: usize) -> Option<usize> {
     let bytes = s.as_bytes();
+    let mut state = Scan::Code;
     let mut depth = 0i32;
-    let mut in_str = false;
     let mut i = open;
     while i < bytes.len() {
         let b = bytes[i];
-        if in_str {
-            match b {
-                b'\\' => i += 1,
-                b'"' => in_str = false,
-                _ => {}
-            }
-        } else {
-            match b {
-                b'"' => in_str = true,
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => {
-                    depth -= 1;
-                    if depth == 0 && b == b')' {
-                        return Some(i);
-                    }
+        match (state, b) {
+            (Scan::Str | Scan::Annotation, b'\\') => i += 1,
+            (Scan::Str, b'"') | (Scan::Annotation, b'>') => state = Scan::Code,
+            (Scan::Code, b'"') => state = Scan::Str,
+            // `<` right after an fd number or AT_FDCWD starts an annotation
+            (Scan::Code, b'<') if i > 0 && bytes[i - 1].is_ascii_alphanumeric() => state = Scan::Annotation,
+            (Scan::Code, b'(' | b'[' | b'{') => depth += 1,
+            (Scan::Code, b')' | b']' | b'}') => {
+                depth -= 1;
+                if depth == 0 && b == b')' {
+                    return Some(i);
                 }
-                _ => {}
             }
+            _ => {}
         }
         i += 1;
     }
@@ -141,22 +148,18 @@ fn parse_return(s: &str) -> Ret {
     } else {
         num_tok.parse::<i64>().ok()
     };
-    let mut errno = None;
-    let mut msg = None;
-    if ret.is_some_and(|r| r < 0) || num_tok == "?" {
-        let name: String = tail
-            .chars()
-            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-            .collect();
-        if name.starts_with('E') && name.len() > 1 {
-            errno = Some(name);
-            if let (Some(a), Some(b)) = (tail.find('('), tail.rfind(')'))
-                && a < b
-            {
-                msg = Some(tail[a + 1..b].to_string());
-            }
-        }
-    }
+    // A failed call prints its errno name (`ENOENT`, `ERESTART_RESTARTBLOCK`)
+    // and the message in parentheses.
+    let failed = ret.is_some_and(|r| r < 0) || num_tok == "?";
+    let name: String = tail
+        .chars()
+        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+        .collect();
+    let errno = (failed && !name.is_empty()).then_some(name);
+    let msg = errno.as_ref().and_then(|_| {
+        let (a, b) = (tail.find('(')?, tail.rfind(')')?);
+        (a < b).then(|| tail[a + 1..b].to_string())
+    });
     (ret, errno, msg, raw)
 }
 
@@ -204,6 +207,28 @@ mod tests {
         assert_eq!(s.syscall, "write");
         assert_eq!(s.ret, Some(11));
         assert!(s.args.ends_with(", 11"));
+    }
+
+    #[test]
+    fn kernel_internal_errno_names() {
+        let s = sys(r#"1.0 read(0</dev/null>, "", 1) = ? ERESTART_RESTARTBLOCK (Interrupted by signal) <0.1>"#);
+        assert_eq!(s.errno.as_deref(), Some("ERESTART_RESTARTBLOCK"));
+        assert_eq!(s.errno_message.as_deref(), Some("Interrupted by signal"));
+        assert_eq!(s.duration_ns, Some(100_000_000));
+    }
+
+    #[test]
+    fn brackets_in_fd_path_annotations() {
+        // real strace -y output for a file named `a(b>c[d` (`>` is escaped as \76)
+        let s = sys(r#"1.0 read(3</tmp/a(b\76c[d>, "x", 64) = 1 <0.000004>"#);
+        assert_eq!(s.syscall, "read");
+        assert_eq!(s.args, r#"3</tmp/a(b\76c[d>, "x", 64"#);
+        assert_eq!(s.ret, Some(1));
+        let s = sys(r#"1.0 close(3</workspace/x)y]>) = 0 <0.000002>"#);
+        assert_eq!((s.syscall.as_str(), s.ret), ("close", Some(0)));
+        let s = sys(r#"1.0 openat(AT_FDCWD</w(s>, "a", O_RDONLY) = 3</w(s/a> <0.000002>"#);
+        assert_eq!(s.args, r#"AT_FDCWD</w(s>, "a", O_RDONLY"#);
+        assert_eq!(s.ret, Some(3));
     }
 
     #[test]
