@@ -24,6 +24,15 @@ base64 = "0.22"
 libc = "0.2"
 strum = { version = "0.28", features = ["derive"] }
 
+[workspace.lints.clippy]
+# Beyond the default set (CI runs clippy with -D warnings):
+# results that must not be ignored, and documented error/panic conditions,
+# so readers (people and AI agents) know how a function can fail.
+must_use_candidate = "warn"
+return_self_not_must_use = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+
 [profile.release]
 lto = "thin"
 codegen-units = 4

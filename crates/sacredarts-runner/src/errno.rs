@@ -10,6 +10,7 @@ use sacredarts_core::ipc::ErrnoInfo;
 /// glibc's `strerrorname_np` (glibc >= 2.32) knows every errno of the target
 /// architecture. Values it does not know are shown as `errno <n>` rather than
 /// being replaced by a made-up name.
+#[must_use]
 pub fn name(e: i32) -> String {
     #[cfg(target_env = "gnu")]
     {
@@ -25,6 +26,7 @@ pub fn name(e: i32) -> String {
     format!("errno {e}")
 }
 
+#[must_use]
 pub fn message(e: i32) -> String {
     let s = std::io::Error::from_raw_os_error(e).to_string();
     // "No such file or directory (os error 2)" -> "No such file or directory"
@@ -34,6 +36,7 @@ pub fn message(e: i32) -> String {
     }
 }
 
+#[must_use]
 pub fn info(e: i32) -> ErrnoInfo {
     ErrnoInfo {
         name: name(e),
@@ -43,6 +46,7 @@ pub fn info(e: i32) -> ErrnoInfo {
 }
 
 /// errno of the last failed libc call on this thread.
+#[must_use]
 pub fn last() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }

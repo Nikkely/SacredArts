@@ -29,6 +29,7 @@ impl ValidationError {
         }
     }
 
+    #[must_use]
     pub fn field(mut self, field: &str) -> Self {
         self.field = Some(field.to_string());
         self
@@ -89,10 +90,12 @@ pub enum OpenFlag {
 }
 
 impl OpenFlag {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         self.into()
     }
 
+    #[must_use]
     pub fn is_access_mode(self) -> bool {
         matches!(self, OpenFlag::O_RDONLY | OpenFlag::O_WRONLY | OpenFlag::O_RDWR)
     }
@@ -115,12 +118,14 @@ pub struct DecodedFlags {
 }
 
 impl DecodedFlags {
+    #[must_use]
     pub fn contains(&self, f: OpenFlag) -> bool {
         self.named.contains(&f)
     }
 
     /// Best effort without the target's flag values (used only when the
     /// runner did not report its decoding): numeric bits stay unnamed.
+    #[must_use]
     pub fn from_request(flags: &[OpenFlag], raw: u32) -> Self {
         let access_mode = flags.iter().fold(raw & O_ACCMODE, |a, f| match f {
             OpenFlag::O_WRONLY => a | 1,
@@ -196,6 +201,7 @@ fn is_zero(v: &u32) -> bool {
 }
 
 impl SyscallRequest {
+    #[must_use]
     pub fn name(&self) -> SyscallName {
         match self {
             SyscallRequest::Getpid => SyscallName::Getpid,
@@ -208,6 +214,19 @@ impl SyscallRequest {
     }
 
     /// Parse untrusted arguments for the syscall `name`.
+    ///
+    /// # Errors
+    ///
+    /// Only for arguments that cannot be passed to the kernel at all; nothing
+    /// the kernel itself would judge is rejected:
+    /// - `unsupported_syscall`: `name` is not one of the supported syscalls
+    /// - `unknown_argument`, `missing_argument`: wrong or missing keys
+    /// - `invalid_argument`: a value of the wrong type, an fd outside the C
+    ///   `int` range, `count` larger than `data`, invalid base64
+    /// - `invalid_flags`, `invalid_mode`: unknown flag names, values that do
+    ///   not fit in a C `int` / `mode_t`
+    /// - `invalid_path`: a NUL byte in the path
+    /// - `limit_exceeded`: path or I/O size above the IPC limits
     pub fn from_user(name: &str, args: &Value) -> Result<Self, ValidationError> {
         let Ok(sys) = name.parse::<SyscallName>() else {
             return Err(ValidationError::new(
@@ -289,6 +308,12 @@ impl SyscallRequest {
 
     /// Re-validate a typed request (used by the runner for defence in depth).
     /// Only marshalling constraints are checked.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_path` / `limit_exceeded` for paths (see [`validate_path`]),
+    /// `limit_exceeded` for I/O sizes above [`MAX_IO_BYTES`], and
+    /// `invalid_argument` if `count` exceeds the data of a `write`.
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
             SyscallRequest::Getpid | SyscallRequest::Close { .. } => Ok(()),
@@ -308,6 +333,11 @@ impl SyscallRequest {
 /// Only rejects paths that cannot be passed to the kernel at all (NUL bytes)
 /// or are too large to marshal. Empty paths, overlong names and where a path
 /// leads are all decided by the kernel (ENOENT, ENAMETOOLONG, EACCES, ...).
+///
+/// # Errors
+///
+/// `limit_exceeded` above [`MAX_PATH_BYTES`]; `invalid_path` if the path
+/// contains a NUL byte.
 pub fn validate_path(path: &str) -> Result<(), ValidationError> {
     if path.len() > MAX_PATH_BYTES {
         return Err(ValidationError::new(
@@ -568,10 +598,16 @@ pub mod b64 {
     use base64::Engine;
     use serde::{Deserialize, Deserializer, Serializer};
 
+    /// # Errors
+    ///
+    /// Whatever the serializer returns.
     pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(v))
     }
 
+    /// # Errors
+    ///
+    /// If the value is not a string or not valid standard base64.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
         base64::engine::general_purpose::STANDARD

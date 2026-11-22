@@ -14,3 +14,6 @@ seccompiler = "0.5"
 
 [dev-dependencies]
 strum.workspace = true
+
+[lints]
+workspace = true

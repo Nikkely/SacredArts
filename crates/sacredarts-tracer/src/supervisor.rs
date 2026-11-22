@@ -117,6 +117,7 @@ fn kill_pid(pid: i32) {
     }
 }
 
+#[must_use]
 pub fn read_seccomp_status(pid: i32, installed: bool) -> SeccompStatus {
     let text = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
     let field = |k: &str| {
@@ -424,6 +425,7 @@ fn send(msg: &SupervisorMessage) {
 }
 
 impl Supervisor {
+    #[must_use]
     pub fn new(cfg: Config) -> Self {
         Supervisor {
             cfg,
@@ -642,6 +644,7 @@ impl Supervisor {
     }
 
     /// Main loop. Returns when the host closes stdin.
+    #[must_use]
     pub fn run(mut self) -> i32 {
         let start = Instant::now();
         let last_activity = Arc::new(AtomicU64::new(0));

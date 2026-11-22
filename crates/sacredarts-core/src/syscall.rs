@@ -32,6 +32,7 @@ pub enum SyscallName {
 }
 
 impl SyscallName {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         self.into()
     }

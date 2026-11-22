@@ -20,6 +20,7 @@ mod linux {
     // `c_long` is `i64` on every supported (64-bit) target; the cast keeps
     // the code explicit about the width the BPF compiler expects.
     #[allow(clippy::unnecessary_cast)]
+    #[must_use]
     pub fn syscall_number(name: SyscallName) -> i64 {
         (match name {
             SyscallName::Getpid => libc::SYS_getpid,
@@ -32,6 +33,7 @@ mod linux {
     }
 
     /// Canonical errno name for a number (glibc's `strerrorname_np`).
+    #[must_use]
     pub fn errno_name(n: i32) -> Option<String> {
         #[cfg(target_env = "gnu")]
         {
@@ -58,6 +60,10 @@ mod linux {
     ];
 
     /// errno number for a name (canonical names and their aliases).
+    ///
+    /// # Errors
+    ///
+    /// If the C library does not know the name.
     pub fn errno_value(e: &DenyErrno) -> Result<u32, String> {
         let name = e.as_str();
         ERRNO_ALIASES
@@ -72,7 +78,11 @@ mod linux {
 
     /// The policy with its errno written by its canonical name (`EWOULDBLOCK`
     /// becomes `EAGAIN`), which is what the kernel's errno is reported as.
-    /// Fails for a policy that cannot be compiled.
+    ///
+    /// # Errors
+    ///
+    /// If the errno name is unknown or the policy cannot be compiled into a
+    /// seccomp filter (see [`compile`]).
     pub fn canonicalize(policy: &Policy) -> Result<Policy, String> {
         let n = errno_value(&policy.errno)?;
         let name = errno_name(n as i32).ok_or_else(|| format!("errno {n} has no name"))?;
@@ -99,6 +109,11 @@ mod linux {
     /// The filter allows everything by default and returns `errno` for the
     /// denied syscall numbers. seccompiler also embeds an architecture check;
     /// a syscall from a foreign ABI kills the process.
+    ///
+    /// # Errors
+    ///
+    /// If the errno name is unknown, the architecture is not supported
+    /// (aarch64 and x86_64 are), or seccompiler rejects the filter.
     pub fn compile(policy: &Policy) -> Result<Option<BpfProgram>, String> {
         if policy.is_empty() {
             return Ok(None);
@@ -121,6 +136,11 @@ mod linux {
     /// Install the compiled filter on the calling thread (and, because the
     /// runner is single-threaded, on the whole process). Irreversible.
     /// seccompiler sets `PR_SET_NO_NEW_PRIVS` before `seccomp(2)`.
+    ///
+    /// # Errors
+    ///
+    /// If the policy cannot be compiled (see [`compile`]) or the kernel
+    /// refuses to install the filter.
     pub fn apply(policy: &Policy) -> Result<bool, String> {
         match compile(policy)? {
             None => Ok(false),

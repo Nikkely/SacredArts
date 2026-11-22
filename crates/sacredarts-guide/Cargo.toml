@@ -13,3 +13,6 @@ serde_yaml_ng = "0.10"
 
 [dev-dependencies]
 strum.workspace = true
+
+[lints]
+workspace = true

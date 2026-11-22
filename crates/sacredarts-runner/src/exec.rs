@@ -79,6 +79,7 @@ fn flag_bits(f: OpenFlag) -> libc::c_int {
 
 /// Decode open flags the way strace does: the access mode, the named bits
 /// (multi-bit flags such as O_TMPFILE and O_SYNC first), then the rest.
+#[must_use]
 pub fn decode_flags(bits: libc::c_int) -> DecodedFlags {
     // Multi-bit flags first; an alias (O_NDELAY, O_RSYNC) never matches
     // because its canonical name comes first and clears the bits.
@@ -130,6 +131,7 @@ pub fn marker(kind: &str, id: u64) {
 }
 
 impl Runner {
+    #[must_use]
     pub fn new(cwd: &Path, ipc_fd: RawFd) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
@@ -138,6 +140,7 @@ impl Runner {
         }
     }
 
+    #[must_use]
     pub fn handles(&self) -> &HandleTable {
         &self.handles
     }

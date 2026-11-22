@@ -14,11 +14,17 @@ pub struct SockIo {
 }
 
 impl SockIo {
+    #[must_use]
     pub fn new(fd: RawFd) -> Self {
         Self { fd, buf: Vec::new() }
     }
 
     /// Next line without the trailing newline; `None` on EOF.
+    ///
+    /// # Errors
+    ///
+    /// `recv(2)` failures (except EINTR, which is retried), a line that is
+    /// not UTF-8, or a line longer than `MAX_IPC_LINE_BYTES`.
     pub fn recv_line(&mut self) -> io::Result<Option<String>> {
         loop {
             if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
@@ -48,6 +54,11 @@ impl SockIo {
         }
     }
 
+    /// Send `line` followed by a newline, retrying short sends.
+    ///
+    /// # Errors
+    ///
+    /// `send(2)` failures (except EINTR), e.g. EPIPE when the supervisor is gone.
     pub fn send_line(&self, line: &str) -> io::Result<()> {
         let mut data = Vec::with_capacity(line.len() + 1);
         data.extend_from_slice(line.as_bytes());

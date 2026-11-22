@@ -164,6 +164,7 @@ pub struct ObservedSyscall {
 
 impl ObservedSyscall {
     /// strace-like line without the timestamp, e.g. `read(3</a>, "x", 4) = 1 <0.000004>`.
+    #[must_use]
     pub fn line(&self) -> String {
         let base = format!("{}({}) = {}", self.syscall, self.args, self.return_raw);
         match self.duration_ns {
@@ -226,7 +227,7 @@ pub enum TracingStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeccompStatus {
-    /// `Seccomp:` field of /proc/<pid>/status (0 = off, 2 = filter).
+    /// `Seccomp:` field of `/proc/<pid>/status` (0 = off, 2 = filter).
     pub mode: Option<u8>,
     /// `Seccomp_filters:` field (Docker's default profile counts as one).
     pub filters: Option<u32>,
@@ -320,6 +321,7 @@ pub enum SupervisorMessage {
 }
 
 impl SupervisorMessage {
+    #[must_use]
     pub fn id(&self) -> Option<u64> {
         match self {
             SupervisorMessage::Ready { .. } | SupervisorMessage::InitFailed { .. } => None,

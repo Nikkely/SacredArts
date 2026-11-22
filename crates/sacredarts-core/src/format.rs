@@ -6,6 +6,7 @@ use crate::request::{Dirfd, OpenFlag, SyscallRequest};
 pub const DISPLAY_BYTES: usize = 32;
 
 /// C-style quoted and escaped byte string, truncated like strace (`"abc"...`).
+#[must_use]
 pub fn quote_bytes(data: &[u8], max: usize) -> String {
     let body: String = data
         .iter()
@@ -25,10 +26,12 @@ pub fn quote_bytes(data: &[u8], max: usize) -> String {
     format!("\"{body}\"{more}")
 }
 
+#[must_use]
 pub fn quote_str(s: &str) -> String {
     quote_bytes(s.as_bytes(), usize::MAX)
 }
 
+#[must_use]
 pub fn format_dirfd(d: Dirfd) -> String {
     match d {
         Dirfd::AtFdcwd => "AT_FDCWD".to_string(),
@@ -37,6 +40,7 @@ pub fn format_dirfd(d: Dirfd) -> String {
 }
 
 /// Named flags followed by any numeric bits (`O_RDWR|0x200000`).
+#[must_use]
 pub fn format_flags(flags: &[OpenFlag], raw: u32) -> String {
     let bits = (raw != 0 || flags.is_empty()).then(|| format!("{raw:#x}"));
     flags
@@ -48,12 +52,14 @@ pub fn format_flags(flags: &[OpenFlag], raw: u32) -> String {
 }
 
 /// Octal with a leading 0, like strace (`0644`, `04755`, `0000`).
+#[must_use]
 pub fn format_mode(mode: u32) -> String {
     format!("0{mode:03o}")
 }
 
 /// Format the call part, e.g. `openat(AT_FDCWD, "a", O_RDONLY)`.
 /// For `read`, the buffer is an output argument; pass the bytes actually read.
+#[must_use]
 pub fn format_call(req: &SyscallRequest, read_data: Option<&[u8]>) -> String {
     match req {
         SyscallRequest::Getpid => "getpid()".to_string(),
@@ -91,6 +97,7 @@ pub fn format_call(req: &SyscallRequest, read_data: Option<&[u8]>) -> String {
 }
 
 /// Format the result part, e.g. ` = 3` or ` = -1 ENOENT (No such file or directory)`.
+#[must_use]
 pub fn format_result(ret: i64, errno: Option<(&str, &str)>) -> String {
     match errno {
         Some((name, msg)) => format!(" = {ret} {name} ({msg})"),

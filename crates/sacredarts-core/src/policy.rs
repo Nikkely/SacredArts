@@ -21,10 +21,12 @@ impl Default for DenyErrno {
 }
 
 impl DenyErrno {
+    #[must_use]
     pub fn new(name: &str) -> Self {
         DenyErrno(name.trim().to_string())
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -42,6 +44,11 @@ pub struct Policy {
 impl Policy {
     /// Build a policy from untrusted user input. Unknown names are rejected,
     /// duplicates removed, and the list sorted for a stable representation.
+    ///
+    /// # Errors
+    ///
+    /// `unsupported_syscall` if `deny` names a syscall SacredArts cannot
+    /// execute. The errno name is not checked here (the sandbox resolves it).
     pub fn from_user(deny: &[String], errno: Option<&str>) -> Result<Self, ValidationError> {
         // A BTreeSet removes duplicates and sorts in one step.
         let deny: BTreeSet<SyscallName> = deny
@@ -66,10 +73,12 @@ impl Policy {
         })
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.deny.is_empty()
     }
 
+    #[must_use]
     pub fn denies(&self, name: SyscallName) -> bool {
         self.deny.contains(&name)
     }

@@ -19,6 +19,7 @@ pub enum TraceLine {
     Other(String),
 }
 
+#[must_use]
 pub fn parse_line(line: &str) -> TraceLine {
     let line = line.trim_end_matches(['\n', '\r']);
     let (timestamp, rest) = split_timestamp(line);

@@ -14,6 +14,7 @@ pub struct HandleTable {
 }
 
 impl HandleTable {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -30,6 +31,7 @@ impl HandleTable {
         info
     }
 
+    #[must_use]
     pub fn get(&self, fd: i32) -> Option<&HandleInfo> {
         self.entries.get(&fd)
     }
@@ -38,14 +40,17 @@ impl HandleTable {
         self.entries.remove(&fd)
     }
 
+    #[must_use]
     pub fn list(&self) -> Vec<HandleInfo> {
         self.entries.values().cloned().collect()
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

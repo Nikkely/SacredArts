@@ -28,3 +28,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [[test]]
 name = "acceptance"
 path = "../../tests/integration/acceptance.rs"
+
+[lints]
+workspace = true

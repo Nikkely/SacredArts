@@ -72,6 +72,12 @@ pub struct Guides {
 }
 
 impl Guides {
+    /// Parse the guide YAML files compiled into the binary.
+    ///
+    /// # Errors
+    ///
+    /// If a file is not valid guide YAML or declares a `name` different from
+    /// its file name.
     pub fn parse_builtin() -> Result<Guides, String> {
         let map = BUILTIN
             .iter()
@@ -87,11 +93,18 @@ impl Guides {
     }
 
     /// Guides compiled into the binary (validated by unit tests).
+    ///
+    /// # Panics
+    ///
+    /// If the embedded guide data is invalid ([`Guides::parse_builtin`]
+    /// fails). A unit test parses every built-in guide, so this cannot
+    /// happen in a tested build.
     pub fn builtin() -> &'static Guides {
         static G: OnceLock<Guides> = OnceLock::new();
         G.get_or_init(|| Guides::parse_builtin().expect("embedded guide data is valid"))
     }
 
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&SyscallGuide> {
         self.map.get(name)
     }
@@ -482,6 +495,7 @@ fn level3(g: &SyscallGuide, v: &InvocationView<'_>) -> String {
     })
 }
 
+#[must_use]
 pub fn render_invocation(guides: &Guides, level: GuideLevel, v: &InvocationView<'_>) -> Rendered {
     let name = v.request.name().as_str();
     let l1 = level1(v);
@@ -518,6 +532,7 @@ pub fn render_invocation(guides: &Guides, level: GuideLevel, v: &InvocationView<
 }
 
 /// `syscall_describe`: specification only, no execution context.
+#[must_use]
 pub fn render_describe(g: &SyscallGuide, level: GuideLevel) -> String {
     text(|s| {
         writeln!(s, "{} — {}", g.name, g.summary)?;
