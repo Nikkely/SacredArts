@@ -418,6 +418,9 @@ impl Supervisor {
     }
 
     fn spawn_runner(&mut self, policy: &Policy) -> Result<RunnerProc, String> {
+        // Reject a policy the kernel filter cannot be built from (e.g. an
+        // unknown errno name) before touching the current runner or strace.
+        sacredarts_policy::compile(policy)?;
         self.generation += 1;
         let generation = self.generation;
         if self.cfg.strace_bin.is_some() && self.strace_failure.is_none() {

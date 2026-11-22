@@ -16,8 +16,8 @@
 openat(AT_FDCWD, "/workspace/hello.txt", O_WRONLY|O_CREAT, 0644) = 3
 ```
 
-strace に似た 1 行だけを表示し、解説文は出しません。構造化レスポンスにはイベント ID、errno、ハンドル情報などがすべて入っています。
-`= 3` は学習用ハンドルです（[tools.md](tools.md#学習用ハンドル仮想-fdについて)）。
+strace に似た 1 行だけを表示し、解説文は出しません。構造化レスポンスにはイベント ID、errno、fd の情報などがすべて入っています。
+`= 3` はカーネルが返した本物の fd です（[tools.md](tools.md#fd-について)）。
 
 ## Level 2 — 短い解説
 
@@ -37,7 +37,7 @@ openat はファイルを開くためのシステムコールです。成功す�
 以降の read・write・close ではこの番号でファイルを指定します。
 
 今回は `hello.txt` をオープンし、読み込み専用で利用できる状態にしています。
-戻り値の `3` はファイルディスクリプタです（SacredArts の学習用ハンドル。カーネル上の実際の fd も 3）。
+戻り値の `3` はファイルディスクリプタです（カーネルが返した値そのもの）。
 以降の read・write・close ではこの `3` を指定します。
 ```
 
@@ -51,9 +51,9 @@ Level 2 に続けて次の節を出します。
 | C の関数シグネチャ | YAML `signature` |
 | 引数（今回の値） | YAML `arguments`（型・意味）＋ 今回の要求の値 |
 | 使用したフラグ | YAML `flags` から今回使ったもの |
-| 戻り値 | 今回の値（openat はハンドルと実 fd）＋ YAML `return_value` |
+| 戻り値 | 今回の値（openat はカーネルが返した fd）＋ YAML `return_value` |
 | errno | 今回の errno ＋ YAML `errors`（起こりうる主な errno） |
-| 実行による状態変化 | 今回（実測）: ハンドルの追加・削除 ＋ 一般: YAML `state_changes` |
+| 実行による状態変化 | 今回（実測）: fd テーブルへの追加・削除 ＋ 一般: YAML `state_changes` |
 | 【実測】カーネルに発行された syscall | Runner の自己申告と strace の観測 |
 | 【一般的な仕様】関連する Linux の内部概念 | YAML `concepts`（VFS、fd テーブル、オープンファイル記述、パス解決、パーミッションなど） |
 | 補足 | 実行時の注記 ＋ YAML `notes` |

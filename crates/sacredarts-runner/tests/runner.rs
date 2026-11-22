@@ -89,6 +89,22 @@ impl Rn {
         }
     }
 
+    /// The runner's socket to the supervisor (the only fd it refuses to use).
+    fn ipc_fd(&self) -> i32 {
+        std::fs::read_dir(format!("/proc/{}/fd", self.hello.pid))
+            .unwrap()
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let target = std::fs::read_link(e.path()).ok()?;
+                target
+                    .to_string_lossy()
+                    .starts_with("socket:")
+                    .then(|| e.file_name().to_string_lossy().parse().unwrap())
+            })
+            .max()
+            .unwrap()
+    }
+
     fn seccomp_filters(&self) -> u32 {
         let s = std::fs::read_to_string(format!("/proc/{}/status", self.hello.pid)).unwrap();
         s.lines()
@@ -125,8 +141,8 @@ fn ok(o: &InvokeOutcome) -> i64 {
     ret
 }
 
-/// Learning handle created by a successful openat.
-fn opened(o: &InvokeOutcome) -> u32 {
+/// fd created by a successful openat.
+fn opened(o: &InvokeOutcome) -> i32 {
     ok(o);
     match o {
         InvokeOutcome::Completed {
@@ -135,6 +151,7 @@ fn opened(o: &InvokeOutcome) -> u32 {
             ..
         } => {
             assert_eq!(info.real_fd as i64, *ret, "ret is the real kernel fd");
+            assert_eq!(info.handle, info.real_fd);
             info.handle
         }
         other => panic!("no handle: {other:?}"),
@@ -184,7 +201,7 @@ fn write_then_read_roundtrip_with_state() {
         json!({"path": "hello.txt", "flags": ["O_CREAT", "O_WRONLY"], "mode": "0644"}),
     );
     let h = opened(&o);
-    assert_eq!(h, 3, "first learning handle is 3");
+    assert_eq!(h, 3, "fds 0-2 are taken (stdio), so the kernel returns 3");
     if let InvokeOutcome::Completed {
         handle_change: Some(HandleChange::Opened { info }),
         issued,
@@ -207,7 +224,7 @@ fn write_then_read_roundtrip_with_state() {
         std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(rn.dir.join("hello.txt")).unwrap().permissions());
     assert_eq!(mode & 0o777, 0o644 & !0o022);
 
-    // re-open and read; handle 3 is reused (lowest free)
+    // re-open and read; fd 3 is reused (lowest free)
     assert_eq!(opened(&rn.call("openat", json!({"path": "hello.txt"}))), 3);
     let o = rn.call("read", json!({"fd": 3, "count": 2}));
     assert_eq!(ok(&o), 2, "partial read returns what was asked");
@@ -239,28 +256,90 @@ fn binary_data_with_nul_bytes() {
 }
 
 #[test]
-fn handle_errors() {
-    let mut rn = Rn::start("handles", Policy::default());
-    // never-opened handles, including the runner's own fd 0 (IPC socket)
-    assert_eq!(rejected(&rn.call("read", json!({"fd": 0, "count": 1}))), "bad_handle");
+fn fds_are_passed_to_the_kernel() {
+    let mut rn = Rn::start("fds", Policy::default());
+    // fds that were never opened: the kernel says EBADF
+    assert_eq!(errno_of(&rn.call("write", json!({"fd": 42, "data": "x"}))), "EBADF");
+    assert_eq!(errno_of(&rn.call("close", json!({"fd": 3}))), "EBADF");
+    assert_eq!(errno_of(&rn.call("read", json!({"fd": -1, "count": 1}))), "EBADF");
+    // stdio exists like in any process: fd 0 is /dev/null, fd 1 too
     assert_eq!(
-        rejected(&rn.call("write", json!({"fd": 42, "data": "x"}))),
-        "bad_handle"
+        ok(&rn.call("read", json!({"fd": 0, "count": 1}))),
+        0,
+        "EOF from /dev/null"
     );
-    assert_eq!(rejected(&rn.call("close", json!({"fd": 3}))), "bad_handle");
+    assert_eq!(ok(&rn.call("write", json!({"fd": 1, "data": "hi"}))), 2);
+    // only the runner's own socket to the supervisor is refused
+    let ipc = rn.ipc_fd();
+    assert!(ipc > 2, "the IPC socket was moved away from fd 0");
+    assert_eq!(rejected(&rn.call("close", json!({"fd": ipc}))), "reserved_fd");
+    assert_eq!(
+        rejected(&rn.call("openat", json!({"dirfd": ipc, "path": "x"}))),
+        "reserved_fd"
+    );
+    assert!(matches!(rn.op(RunnerOp::Ping), RunnerReplyBody::Pong));
     // kernel-level permission errors are real errnos
     std::fs::write(rn.dir.join("r.txt"), b"data").unwrap();
     ok(&rn.call("openat", json!({"path": "r.txt", "flags": ["O_RDONLY"]})));
     assert_eq!(errno_of(&rn.call("write", json!({"fd": 3, "data": "x"}))), "EBADF");
     ok(&rn.call("close", json!({"fd": 3})));
     assert_eq!(
-        rejected(&rn.call("close", json!({"fd": 3}))),
-        "bad_handle",
+        errno_of(&rn.call("close", json!({"fd": 3}))),
+        "EBADF",
         "use after close"
     );
-    // read on a directory handle
+    // read on a directory fd
     ok(&rn.call("openat", json!({"path": ".", "flags": ["O_RDONLY", "O_DIRECTORY"]})));
     assert_eq!(errno_of(&rn.call("read", json!({"fd": 3, "count": 4}))), "EISDIR");
+}
+
+#[test]
+fn flags_and_modes_are_passed_verbatim() {
+    let mut rn = Rn::start("flags", Policy::default());
+    let args = |o: &InvokeOutcome| match o {
+        InvokeOutcome::Completed { issued, .. } => issued[0].args.clone(),
+        other => panic!("{other:?}"),
+    };
+    // numeric flags are decoded like strace (0o101 = O_WRONLY|O_CREAT on every Linux arch)
+    let o = rn.call("openat", json!({"path": "n.txt", "flags": 0o101, "mode": "0640"}));
+    opened(&o);
+    assert_eq!(args(&o), r#"AT_FDCWD, "n.txt", O_WRONLY|O_CREAT, 0640"#);
+    // O_CREAT without a mode: the kernel gets 0 and creates a 0000 file
+    let o = rn.call("openat", json!({"path": "z.txt", "flags": "O_WRONLY|O_CREAT"}));
+    opened(&o);
+    assert_eq!(args(&o), r#"AT_FDCWD, "z.txt", O_WRONLY|O_CREAT, 0000"#);
+    let meta = std::fs::metadata(rn.dir.join("z.txt")).unwrap();
+    assert_eq!(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o7777, 0);
+    // O_PATH: an fd that cannot be read
+    let p = opened(&rn.call("openat", json!({"path": ".", "flags": ["O_PATH"]})));
+    assert_eq!(errno_of(&rn.call("read", json!({"fd": p, "count": 1}))), "EBADF");
+    // access mode 3 (O_WRONLY|O_RDWR) is accepted by Linux; neither read nor write works
+    std::fs::write(rn.dir.join("m3"), b"x").unwrap();
+    let o = rn.call("openat", json!({"path": "m3", "flags": ["O_WRONLY", "O_RDWR"]}));
+    let m3 = opened(&o);
+    assert_eq!(args(&o), r#"AT_FDCWD, "m3", 0x3"#);
+    assert_eq!(errno_of(&rn.call("read", json!({"fd": m3, "count": 1}))), "EBADF");
+    // bits without a name are passed on and shown in hex
+    let o = rn.call("openat", json!({"path": "m3", "flags": "O_RDONLY|0x40000000"}));
+    opened(&o);
+    assert_eq!(args(&o), r#"AT_FDCWD, "m3", O_RDONLY|0x40000000"#);
+    // the sticky bit is fine for a directory we own
+    ok(&rn.call("mkdirat", json!({"path": "sticky", "mode": "01777"})));
+    let meta = std::fs::metadata(rn.dir.join("sticky")).unwrap();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o1000,
+        0o1000
+    );
+    // path limits are the kernel's
+    assert_eq!(errno_of(&rn.call("openat", json!({"path": ""}))), "ENOENT");
+    assert_eq!(
+        errno_of(&rn.call("openat", json!({"path": "x".repeat(300)}))),
+        "ENAMETOOLONG"
+    );
+    assert_eq!(
+        errno_of(&rn.call("openat", json!({"path": "a/".repeat(3000)}))),
+        "ENAMETOOLONG"
+    );
 }
 
 #[test]
@@ -317,10 +396,7 @@ fn dirfd_handles() {
         errno_of(&rn.call("mkdirat", json!({"dirfd": 4, "path": "x/y"}))),
         "ENOTDIR"
     );
-    assert_eq!(
-        rejected(&rn.call("openat", json!({"dirfd": 9, "path": "x"}))),
-        "bad_handle"
-    );
+    assert_eq!(errno_of(&rn.call("openat", json!({"dirfd": 9, "path": "x"}))), "EBADF");
 }
 
 #[test]
@@ -352,15 +428,27 @@ fn paths_are_passed_to_the_kernel_verbatim() {
 }
 
 #[test]
-fn handle_limit() {
+fn emfile_comes_from_the_kernel() {
     let mut rn = Rn::start("limit", Policy::default());
     std::fs::write(rn.dir.join("f"), b"").unwrap();
-    for _ in 0..sacredarts_core::limits::MAX_HANDLES {
-        ok(&rn.call("openat", json!({"path": "f"})));
+    // lower RLIMIT_NOFILE of the running runner to 16 (fds 0..15)
+    let lim = libc::rlimit {
+        rlim_cur: 16,
+        rlim_max: 16,
+    };
+    // SAFETY: prlimit on our own child with a valid rlimit struct.
+    assert_eq!(
+        unsafe { libc::prlimit(rn.hello.pid, libc::RLIMIT_NOFILE, &lim, std::ptr::null_mut()) },
+        0
+    );
+    for fd in 3..16 {
+        assert_eq!(opened(&rn.call("openat", json!({"path": "f"}))), fd);
     }
-    assert_eq!(rejected(&rn.call("openat", json!({"path": "f"}))), "limit_exceeded");
+    assert_eq!(errno_of(&rn.call("openat", json!({"path": "f"}))), "EMFILE");
     ok(&rn.call("close", json!({"fd": 10})));
     assert_eq!(opened(&rn.call("openat", json!({"path": "f"}))), 10);
+    // the IPC socket above the limit keeps working
+    assert!(matches!(rn.op(RunnerOp::Ping), RunnerReplyBody::Pong));
 }
 
 #[test]
@@ -413,6 +501,19 @@ fn denying_io_syscalls_does_not_break_ipc() {
     assert_eq!(errno_of(&rn.call("write", json!({"fd": 3, "data": "hi"}))), "EACCES");
     assert_eq!(errno_of(&rn.call("read", json!({"fd": 3, "count": 1}))), "EACCES");
     assert_eq!(errno_of(&rn.call("getpid", json!({}))), "EACCES");
+    drop(rn);
+    // any errno name the C library knows can be used
+    let mut rn = Rn::start("eio", Policy::from_user(&["getpid".into()], Some("EIO")).unwrap());
+    assert_eq!(errno_of(&rn.call("getpid", json!({}))), "EIO");
+    drop(rn);
+    let mut rn = Rn::start(
+        "io2",
+        Policy::from_user(&["read".into(), "write".into(), "close".into()], Some("EACCES")).unwrap(),
+    );
+    ok(&rn.call(
+        "openat",
+        json!({"path": "x", "flags": ["O_RDWR", "O_CREAT"], "mode": "0644"}),
+    ));
     // close denied: the handle must survive (kernel did not release the fd)
     assert_eq!(errno_of(&rn.call("close", json!({"fd": 3}))), "EACCES");
     if let RunnerReplyBody::Handles { handles } = rn.op(RunnerOp::ListHandles) {

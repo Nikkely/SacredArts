@@ -106,7 +106,7 @@ pub struct InvocationView<'a> {
     pub requested_line: String,
     /// false if an internal step failed before the requested syscall.
     pub executed: bool,
-    /// Value returned to the AI (a learning handle for openat).
+    /// Value returned to the AI (the kernel's return value).
     pub ret: i64,
     /// Value the kernel actually returned.
     pub kernel_ret: i64,
@@ -134,13 +134,24 @@ pub struct Rendered {
     pub text: String,
 }
 
-fn access_ja(flags: &[OpenFlag]) -> String {
-    let mode = if flags.contains(&OpenFlag::O_RDWR) {
-        "読み書き両用で利用できる"
-    } else if flags.contains(&OpenFlag::O_WRONLY) {
-        "書き込み専用で利用できる"
+fn access_ja(flags: &[OpenFlag], raw: u32) -> String {
+    // O_RDONLY=0, O_WRONLY=1, O_RDWR=2 on every Linux architecture.
+    let acc = flags
+        .iter()
+        .fold(raw & sacredarts_core::request::O_ACCMODE, |a, f| match f {
+            OpenFlag::O_WRONLY => a | 1,
+            OpenFlag::O_RDWR => a | 2,
+            _ => a,
+        });
+    let mode = if flags.contains(&OpenFlag::O_PATH) {
+        "読み書きはできず、場所だけを指す（O_PATH）fd として利用できる"
     } else {
-        "読み込み専用で利用できる"
+        match acc {
+            2 => "読み書き両用で利用できる",
+            1 => "書き込み専用で利用できる",
+            3 => "アクセスモード 3 で（読み書きの権限は検査されるが、read も write もできない）利用できる",
+            _ => "読み込み専用で利用できる",
+        }
     };
     let mut pre = String::new();
     if flags.contains(&OpenFlag::O_CREAT) {
@@ -174,9 +185,11 @@ fn fill(template: &str, v: &InvocationView<'_>) -> String {
         ("errno_message", v.errno.map(|e| e.message.clone()).unwrap_or_default()),
     ];
     match v.request {
-        SyscallRequest::Openat { path, flags, .. } => {
+        SyscallRequest::Openat {
+            path, flags, raw_flags, ..
+        } => {
             vars.push(("path", path.clone()));
-            vars.push(("flags_ja", access_ja(flags)));
+            vars.push(("flags_ja", access_ja(flags, *raw_flags)));
         }
         SyscallRequest::Mkdirat { path, mode, .. } => {
             vars.push(("path", path.clone()));
@@ -285,18 +298,19 @@ fn arg_values(req: &SyscallRequest, v: &InvocationView<'_>) -> Vec<(String, Stri
             dirfd,
             path,
             flags,
+            raw_flags,
             mode,
         } => vec![
             ("dirfd".into(), format_dirfd(*dirfd)),
             ("pathname".into(), quote_str(path)),
-            ("flags".into(), format_flags(flags)),
+            ("flags".into(), format_flags(flags, *raw_flags)),
             (
                 "mode".into(),
                 mode.map(format_mode).unwrap_or_else(|| "（指定なし）".into()),
             ),
         ],
         SyscallRequest::Read { fd, count } => vec![
-            ("fd".into(), format!("{fd}（学習用ハンドル）")),
+            ("fd".into(), fd.to_string()),
             (
                 "buf".into(),
                 match v.read_data {
@@ -307,11 +321,11 @@ fn arg_values(req: &SyscallRequest, v: &InvocationView<'_>) -> Vec<(String, Stri
             ("count".into(), count.to_string()),
         ],
         SyscallRequest::Write { fd, data, count } => vec![
-            ("fd".into(), format!("{fd}（学習用ハンドル）")),
+            ("fd".into(), fd.to_string()),
             ("buf".into(), quote_bytes(&data[..*count], DISPLAY_BYTES)),
             ("count".into(), count.to_string()),
         ],
-        SyscallRequest::Close { fd } => vec![("fd".into(), format!("{fd}（学習用ハンドル）"))],
+        SyscallRequest::Close { fd } => vec![("fd".into(), fd.to_string())],
         SyscallRequest::Mkdirat { dirfd, path, mode } => vec![
             ("dirfd".into(), format_dirfd(*dirfd)),
             ("pathname".into(), quote_str(path)),
@@ -346,7 +360,7 @@ fn level3(g: &SyscallGuide, v: &InvocationView<'_>) -> String {
         }
     }
 
-    if let SyscallRequest::Openat { flags, .. } = v.request {
+    if let SyscallRequest::Openat { flags, raw_flags, .. } = v.request {
         let _ = writeln!(s, "\n## 使用したフラグ");
         for f in flags {
             let d = g
@@ -357,16 +371,18 @@ fn level3(g: &SyscallGuide, v: &InvocationView<'_>) -> String {
                 .unwrap_or("");
             let _ = writeln!(s, "- `{}`: {}", f.as_str(), d);
         }
+        if *raw_flags != 0 {
+            let _ = writeln!(
+                s,
+                "- `{raw_flags:#x}`: 数値で指定されたビット（そのままカーネルに渡しました。名前付きの解釈は「発行した syscall」の行を参照）"
+            );
+        }
     }
 
     let _ = writeln!(s, "\n## 戻り値");
     match (v.errno, v.request, v.handle) {
         (None, SyscallRequest::Openat { .. }, Some(h)) => {
-            let _ = writeln!(
-                s,
-                "今回: `{}`（学習用ハンドル）。カーネルが実際に返した fd は `{}` です。",
-                h.handle, h.real_fd
-            );
+            let _ = writeln!(s, "今回: `{}`（カーネルが返したファイルディスクリプタ）", h.real_fd);
         }
         (None, _, _) => {
             let _ = writeln!(s, "今回: `{}`", v.ret);
@@ -396,22 +412,19 @@ fn level3(g: &SyscallGuide, v: &InvocationView<'_>) -> String {
         (Some(h), SyscallRequest::Openat { .. }, None) => {
             let _ = writeln!(
                 s,
-                "今回（実測）: ハンドル {} → 実 fd {}（{}）が fd テーブルに追加されました。",
-                h.handle, h.real_fd, h.path
+                "今回（実測）: fd {}（{}）がプロセスの fd テーブルに追加されました。",
+                h.real_fd, h.path
             );
         }
         (Some(h), SyscallRequest::Close { .. }, _) => {
             let _ = writeln!(
                 s,
-                "今回（実測）: ハンドル {} → 実 fd {} がハンドル表から削除されました。",
-                h.handle, h.real_fd
+                "今回（実測）: fd {}（{}）がプロセスの fd テーブルから削除されました。",
+                h.real_fd, h.path
             );
         }
         (_, _, Some(_)) => {
-            let _ = writeln!(
-                s,
-                "今回（実測）: 失敗したため、学習用の状態（ハンドル）は変化していません。"
-            );
+            let _ = writeln!(s, "今回（実測）: 失敗したため、fd テーブルは変化していません。");
         }
         _ => {}
     }
@@ -590,7 +603,7 @@ mod tests {
             requested_line: format_call(req, None) + &format_result(3, None),
             executed: true,
             ret: 3,
-            kernel_ret: 4,
+            kernel_ret: 3,
             errno: None,
             handle,
             read_data: None,
@@ -608,19 +621,20 @@ mod tests {
             dirfd: Dirfd::AtFdcwd,
             path: "/workspace/hello.txt".into(),
             flags: vec![OpenFlag::O_WRONLY, OpenFlag::O_CREAT],
+            raw_flags: 0,
             mode: Some(0o644),
         };
         let h = HandleInfo {
             handle: 3,
-            real_fd: 4,
+            real_fd: 3,
             path: "/workspace/hello.txt".into(),
-            flags: vec![],
+            flags: "O_WRONLY|O_CREAT".into(),
         };
         let issued = vec![IssuedCall {
             syscall: "openat".into(),
             purpose: IssuedPurpose::Requested,
             args: "AT_FDCWD, \"/workspace/hello.txt\", O_WRONLY|O_CREAT, 0644".into(),
-            ret: 4,
+            ret: 3,
             errno: None,
         }];
         let g = Guides::builtin();

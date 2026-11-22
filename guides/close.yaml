@@ -48,11 +48,11 @@ man_pages:
   - close(2)
 explain:
   success: |
-    学習用ハンドル `{fd}` を閉じました（実際にはカーネル fd {real_fd} を close しています）。
-    このハンドル番号は次の openat で再利用される可能性があり、閉じた後に read/write すると失敗します。
+    fd `{fd}` を閉じました。
+    この番号は次の openat で再利用される可能性があり、閉じた後に read/write すると EBADF で失敗します。
   failure: |
     close が `{errno}`（{errno_message}）で失敗しました。
 notes:
   - |
     Linux の close は、エラーを返した場合でも fd を解放していることがあります（EINTR など）。
-    SacredArts は失敗時に fcntl(F_GETFD) でカーネルに fd がまだ存在するかを確認し、ハンドル表を実際の状態に合わせます。
+    SacredArts は失敗時に fcntl(F_GETFD) でカーネルに fd がまだ存在するかを確認し、記録している fd の一覧を実際の状態に合わせます。

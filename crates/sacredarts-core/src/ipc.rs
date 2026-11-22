@@ -6,7 +6,7 @@
 //! ```
 
 use crate::policy::Policy;
-use crate::request::{OpenFlag, SyscallRequest};
+use crate::request::SyscallRequest;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -89,13 +89,15 @@ pub struct IssuedCall {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandleInfo {
-    /// Learning handle number shown to the AI.
-    pub handle: u32,
-    /// Real kernel file descriptor inside the runner process.
+    /// File descriptor number. Kept for compatibility; always equal to
+    /// `real_fd` (SacredArts passes fds to the kernel verbatim).
+    pub handle: i32,
+    /// Kernel file descriptor inside the runner process.
     pub real_fd: i32,
-    /// Path as requested (virtual /workspace path).
+    /// Path as requested, joined with the dirfd's path for display.
     pub path: String,
-    pub flags: Vec<OpenFlag>,
+    /// Flags as the kernel received them, decoded strace-style.
+    pub flags: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,7 +285,7 @@ pub enum SupervisorMessage {
         id: u64,
         kind: SupervisorErrorKind,
         message: String,
-        /// true if learning state (handles) was lost.
+        /// true if the runner was recreated and its open fds were lost.
         state_reset: bool,
         runner: Option<RunnerInfo>,
     },

@@ -4,34 +4,38 @@ use crate::request::ValidationError;
 use crate::syscall::SyscallName;
 use serde::{Deserialize, Serialize};
 
-/// errno returned by the kernel when a denied syscall is attempted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum DenyErrno {
-    #[default]
-    EPERM,
-    EACCES,
-    ENOSYS,
+/// errno returned by the kernel when a denied syscall is attempted, by name
+/// (`EPERM`, `ENOSYS`, `EIO`, ...). Any errno the C library inside the sandbox
+/// knows is accepted; the name is resolved to its number there, so an unknown
+/// name makes `policy_set` fail and the previous policy stays active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DenyErrno(String);
+
+impl Default for DenyErrno {
+    fn default() -> Self {
+        DenyErrno("EPERM".into())
+    }
 }
 
 impl DenyErrno {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DenyErrno::EPERM => "EPERM",
-            DenyErrno::EACCES => "EACCES",
-            DenyErrno::ENOSYS => "ENOSYS",
-        }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
+    /// Lexical check only (`E` followed by upper-case letters / digits).
     pub fn parse(s: &str) -> Result<Self, ValidationError> {
-        match s {
-            "EPERM" => Ok(DenyErrno::EPERM),
-            "EACCES" => Ok(DenyErrno::EACCES),
-            "ENOSYS" => Ok(DenyErrno::ENOSYS),
-            other => Err(ValidationError::new(
+        let t = s.trim();
+        let ok =
+            t.len() > 1 && t.starts_with('E') && t[1..].bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+        if ok {
+            Ok(DenyErrno(t.to_string()))
+        } else {
+            Err(ValidationError::new(
                 "invalid_errno",
-                format!("unsupported errno {other:?}; allowed: EPERM, EACCES, ENOSYS"),
+                format!("{s:?} is not an errno name (expected something like EPERM, ENOSYS, EIO)"),
             )
-            .field("errno")),
+            .field("errno"))
         }
     }
 }
@@ -67,7 +71,7 @@ impl Policy {
         out.dedup();
         let errno = match errno {
             Some(e) => DenyErrno::parse(e)?,
-            None => DenyErrno::EPERM,
+            None => DenyErrno::default(),
         };
         Ok(Policy { deny: out, errno })
     }
@@ -89,9 +93,13 @@ mod tests {
     fn from_user_validates() {
         let p = Policy::from_user(&["mkdirat".into(), "getpid".into(), "mkdirat".into()], None).unwrap();
         assert_eq!(p.deny, vec![SyscallName::Getpid, SyscallName::Mkdirat]);
-        assert_eq!(p.errno, DenyErrno::EPERM);
+        assert_eq!(p.errno.as_str(), "EPERM");
         assert!(Policy::from_user(&["sendto".into()], None).is_err());
-        assert!(Policy::from_user(&[], Some("EBADF")).is_err());
-        assert_eq!(Policy::from_user(&[], Some("EACCES")).unwrap().errno, DenyErrno::EACCES);
+        for e in ["EBADF", "EIO", "ENOSYS", "E2BIG"] {
+            assert_eq!(Policy::from_user(&[], Some(e)).unwrap().errno.as_str(), e);
+        }
+        assert!(Policy::from_user(&[], Some("eperm")).is_err());
+        assert!(Policy::from_user(&[], Some("E")).is_err());
+        assert_eq!(serde_json::to_string(&DenyErrno::default()).unwrap(), "\"EPERM\"");
     }
 }

@@ -34,10 +34,10 @@ impl From<TraceModeParam> for TraceMode {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PolicyParam {
-    /// Learning syscalls to deny with seccomp (subset of: getpid, openat, read, write, close, mkdirat).
+    /// Syscalls to deny with seccomp (subset of: getpid, openat, read, write, close, mkdirat).
     #[serde(default)]
     pub deny: Vec<String>,
-    /// errno returned for denied syscalls: EPERM (default), EACCES or ENOSYS.
+    /// errno name returned for denied syscalls, e.g. EPERM (default), ENOSYS, EIO; any errno name Linux defines.
     pub errno: Option<String>,
 }
 
@@ -83,9 +83,9 @@ pub struct TraceGetParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PolicySetParams {
     pub session_id: String,
-    /// Learning syscalls to deny (empty list removes all restrictions).
+    /// Syscalls to deny (empty list removes all restrictions).
     pub deny: Vec<String>,
-    /// EPERM (default), EACCES or ENOSYS.
+    /// errno name for denied syscalls: EPERM (default) or any other errno name (ENOSYS, EIO, ...).
     pub errno: Option<String>,
 }
 
@@ -161,17 +161,17 @@ pub struct SacredArts {
 
 const INVOKE_DESCRIPTION: &str = r#"Follow the activation rule in the SacredArts server instructions (use only after the user's incantation "System Call" / "システムコール").
 Execute one Linux system call inside the sandbox and return the result (strace-like line, return value, errno, guide).
-State (open handles) persists between calls of the same session.
-Supported syscalls and args:
+State (open fds) persists between calls of the same session.
+Arguments are passed to the kernel verbatim and the kernel decides (EBADF, EMFILE, ENAMETOOLONG, EACCES, EROFS, ...):
 - getpid: {}
-- openat: {"dirfd"?: "AT_FDCWD" | <handle>, "path": any absolute or relative path, "flags"?: ["O_WRONLY","O_CREAT",...] or "O_WRONLY|O_CREAT" (default O_RDONLY), "mode"?: "0644" (required with O_CREAT)}
-  flags: O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_TRUNC O_APPEND O_DIRECTORY O_NOFOLLOW O_CLOEXEC
-  Returns a *learning handle* (lowest free number >= 3) that maps to a real kernel fd (shown in handle.real_fd).
-- read: {"fd": <handle>, "count": <0..65536>}  -> data_text (if UTF-8) and data_base64
-- write: {"fd": <handle>, "data": "...", "encoding"?: "utf8"|"base64", "count"?: <bytes, default all>}
-- close: {"fd": <handle>}
-- mkdirat: {"dirfd"?: "AT_FDCWD" | <handle>, "path": "...", "mode"?: "0755"}
-Paths are passed to the kernel verbatim (cwd is /workspace); the kernel decides what is reachable inside the container (non-root, read-only root filesystem; /workspace and /tmp are writable). A failing syscall (errno) is a normal result with success=false; tool errors are only for invalid arguments or infrastructure problems."#;
+- openat: {"dirfd"?: "AT_FDCWD" | <fd>, "path": any path, "flags"?: ["O_WRONLY","O_CREAT",...] | "O_WRONLY|O_CREAT|0x80000" | <int> (default O_RDONLY), "mode"?: "0644" | <int> (0 if omitted)}
+  flags: every Linux O_* name (O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_NOCTTY O_TRUNC O_APPEND O_NONBLOCK O_NDELAY O_DSYNC O_SYNC O_RSYNC O_ASYNC O_DIRECT O_LARGEFILE O_DIRECTORY O_NOFOLLOW O_NOATIME O_CLOEXEC O_PATH O_TMPFILE) and/or numbers.
+  Returns the real kernel fd (fds 0-2 are /dev/null and the runner's stderr, so the first file is usually 3).
+- read: {"fd": <int>, "count": <0..65536>}  -> data_text (if UTF-8) and data_base64
+- write: {"fd": <int>, "data": "...", "encoding"?: "utf8"|"base64", "count"?: <bytes, default all>}
+- close: {"fd": <int>}
+- mkdirat: {"dirfd"?: "AT_FDCWD" | <fd>, "path": "...", "mode"?: "0755" | <int>}
+Any fd number may be used except the runner's own socket to the supervisor (rejected as reserved_fd). RLIMIT_NOFILE is 256. cwd is /workspace; the container is non-root with a read-only root filesystem (/workspace and /tmp are writable). A failing syscall (errno) is a normal result with success=false; tool errors are only for arguments that cannot be marshalled or infrastructure problems."#;
 
 #[tool_router(router = tool_router)]
 impl SacredArts {
@@ -285,7 +285,7 @@ impl SacredArts {
     }
 
     #[tool(
-        description = "Get the session's event history in chronological order: `requested` events (what the AI asked, incl. learning-handle -> real-fd mapping and the runner's self-reported kernel calls), `observed` events (syscalls strace actually saw), and `lifecycle` events. Paging via after_event_id / next_after_event_id. History is bounded. Follow the activation rule in the SacredArts server instructions (use only after the user's incantation \"System Call\" / \"システムコール\")."
+        description = "Get the session's event history in chronological order: `requested` events (what the AI asked, incl. the runner's self-reported kernel calls), `observed` events (syscalls strace actually saw), and `lifecycle` events. Paging via after_event_id / next_after_event_id. History is bounded. Follow the activation rule in the SacredArts server instructions (use only after the user's incantation \"System Call\" / \"システムコール\")."
     )]
     async fn trace_get(&self, params: Parameters<TraceGetParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
@@ -333,7 +333,6 @@ impl SacredArts {
             "retained_events": page.total_retained,
             "notes": [
                 "requested and observed events share request_id but are not 1:1",
-                "requested return_value for openat is the learning handle; details.kernel_return_value and observed events show the real fd",
                 "observed events come from strace -ttt -T -y; fields strace did not report are null"
             ],
         });
@@ -341,7 +340,7 @@ impl SacredArts {
     }
 
     #[tool(
-        description = "Replace the seccomp deny policy. The runner is recreated with the new kernel filter, so open handles are lost (state_reset: true). The switch is committed only after the new runner is healthy; on failure the old runner and policy stay active. Follow the activation rule in the SacredArts server instructions (use only after the user's incantation \"System Call\" / \"システムコール\")."
+        description = "Replace the seccomp deny policy. The runner is recreated with the new kernel filter, so open fds are lost (state_reset: true). The switch is committed only after the new runner is healthy; on failure the old runner and policy stay active. Follow the activation rule in the SacredArts server instructions (use only after the user's incantation \"System Call\" / \"システムコール\")."
     )]
     async fn policy_set(&self, params: Parameters<PolicySetParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
@@ -361,7 +360,7 @@ impl SacredArts {
                     "seccomp_evidence": runner.seccomp_evidence.iter().map(|e| &e.raw).collect::<Vec<_>>(),
                 });
                 let text = format!(
-                    "Policy applied: deny={:?} errno={}. Runner recreated (generation {} -> {}, pid {}); all handles were closed (state_reset: true).\nseccomp: mode={} filters={} (Docker's default profile counts as one filter)",
+                    "Policy applied: deny={:?} errno={}. Runner recreated (generation {} -> {}, pid {}); all fds were closed (state_reset: true).\nseccomp: mode={} filters={} (Docker's default profile counts as one filter)",
                     runner.policy.deny.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
                     runner.policy.errno.as_str(),
                     old_runner.generation,
@@ -377,7 +376,7 @@ impl SacredArts {
     }
 
     #[tool(
-        description = "Show session state: runner pid, open learning handles (handle -> real fd), working directory and its entries, policy and seccomp status, guide level, trace mode, event counts. Follow the activation rule in the SacredArts server instructions (use only after the user's incantation \"System Call\" / \"システムコール\")."
+        description = "Show session state: runner pid, fds opened in this session (with paths), working directory and its entries, policy and seccomp status, guide level, trace mode, event counts. Follow the activation rule in the SacredArts server instructions (use only after the user's incantation \"System Call\" / \"システムコール\")."
     )]
     async fn sandbox_inspect(&self, params: Parameters<SessionParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
@@ -394,7 +393,7 @@ impl SacredArts {
                 meta["cwd"] = json!(info.cwd);
                 meta["workspace_entries"] = json!(info.workspace_entries);
                 let mut text = format!(
-                    "session {}\nrunner pid {} (generation {}), cwd {}\npolicy deny={:?} errno={}; seccomp mode={} filters={} (Docker's default profile counts as one filter)\nguide_level={} trace_mode={}\nopen handles:",
+                    "session {}\nrunner pid {} (generation {}), cwd {}\npolicy deny={:?} errno={}; seccomp mode={} filters={} (Docker's default profile counts as one filter)\nguide_level={} trace_mode={}\nopen fds:",
                     p.session_id,
                     info.runner.pid,
                     info.runner.generation,
@@ -410,13 +409,7 @@ impl SacredArts {
                     text.push_str(" (none)");
                 }
                 for h in &info.handles {
-                    text.push_str(&format!(
-                        "\n  handle {} -> real fd {}  {}  [{}]",
-                        h.handle,
-                        h.real_fd,
-                        h.path,
-                        sacredarts_core::format::format_flags(&h.flags)
-                    ));
+                    text.push_str(&format!("\n  fd {}  {}  [{}]", h.real_fd, h.path, h.flags));
                 }
                 text.push_str("\n/workspace:");
                 for e in &info.workspace_entries {
@@ -447,7 +440,7 @@ impl SacredArts {
     }
 
     #[tool(
-        description = "Change the guide level (1-3) of a session, and optionally its trace mode. The runner is NOT recreated: open handles are kept. Follow the activation rule in the SacredArts server instructions (use only after the user's incantation \"System Call\" / \"システムコール\")."
+        description = "Change the guide level (1-3) of a session, and optionally its trace mode. The runner is NOT recreated: open fds are kept. Follow the activation rule in the SacredArts server instructions (use only after the user's incantation \"System Call\" / \"システムコール\")."
     )]
     async fn session_set_guide(&self, params: Parameters<SessionSetGuideParams>) -> Result<CallToolResult, McpError> {
         let p = params.0;
@@ -458,7 +451,7 @@ impl SacredArts {
         match self.mgr.set_guide(&p.session_id, g, p.trace_mode.map(Into::into)).await {
             Ok((g, tm, runner)) => Ok(ok(
                 format!(
-                    "guide_level={} trace_mode={tm:?} (runner pid {} generation {} unchanged; handles kept)",
+                    "guide_level={} trace_mode={tm:?} (runner pid {} generation {} unchanged; fds kept)",
                     g.as_u8(),
                     runner.pid,
                     runner.generation
@@ -569,7 +562,6 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
                     "handle": h.handle,
                     "real_fd": h.real_fd,
                     "path": h.path,
-                    "note": "SacredArts returns learning handles, not raw kernel fds; real_fd is the descriptor inside the runner process",
                 });
             }
             if let Some(d) = &data {
@@ -598,9 +590,9 @@ impl ServerHandler for SacredArts {
                 "SacredArts — AI-powered Linux System Call Laboratory. Invoke. Observe. Understand.\n\
                  {}\n\
                  Typical flow: sandbox_create -> syscall_invoke (openat/write/read/close/mkdirat/getpid) -> trace_get / sandbox_inspect -> sandbox_destroy.\n\
-                 Supported syscalls: {}. cwd is /workspace; any path may be used and the kernel decides (non-root, read-only root fs). openat returns learning handles (mapped to real fds).\n\
+                 Supported syscalls: {}. cwd is /workspace; any path may be used and the kernel decides (non-root, read-only root fs). Arguments (fds, flags, modes, paths) go to the kernel verbatim; openat returns the real fd.\n\
                  guide_level 1-3 controls explanation detail; trace_mode requested|all controls whether strace-observed kernel syscalls are shown.\n\
-                 policy_set installs a kernel seccomp filter (runner is recreated, handles are lost).",
+                 policy_set installs a kernel seccomp filter (runner is recreated, open fds are lost).",
                 self.mgr.cfg.activation.instructions(),
                 SyscallName::names().join(", ")
             ))

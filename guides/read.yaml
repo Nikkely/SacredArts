@@ -58,7 +58,7 @@ man_pages:
   - read(2)
 explain:
   success: |
-    ハンドル `{fd}` から最大 {count} バイトを要求し、実際には `{ret}` バイト読めました。{eof_note}
+    fd `{fd}` から最大 {count} バイトを要求し、実際には `{ret}` バイト読めました。{eof_note}
     ファイルオフセットは読んだ分だけ進んだので、次の read は続きから読みます。
   failure: |
     read が `{errno}`（{errno_message}）で失敗しました。

@@ -5,17 +5,18 @@
 //! different one), and a seccomp filter on that number applies.
 
 //!
-//! Paths are passed to the kernel exactly as requested: no rewriting, no
-//! added flags, no confinement to /workspace. What a path may reach is
-//! decided by the kernel (permissions, read-only root filesystem, ...) inside
-//! the sandbox container, which is the security boundary.
+//! Arguments are passed to the kernel exactly as requested: paths are not
+//! rewritten or confined, flags and modes are not filtered, and any fd number
+//! reaches the kernel (EBADF, EMFILE, ENAMETOOLONG, ... come from there).
+//! The kernel inside the sandbox container is the security boundary. The one
+//! exception is the runner's own IPC socket, which keeps the session alive.
 
 use crate::errno;
 use crate::handles::HandleTable;
 use base64::Engine;
-use sacredarts_core::format::{DISPLAY_BYTES, format_flags, format_mode, quote_bytes, quote_str};
+use sacredarts_core::format::{DISPLAY_BYTES, format_mode, quote_bytes, quote_str};
 use sacredarts_core::ipc::{HandleChange, InvokeOutcome, IssuedCall, IssuedPurpose};
-use sacredarts_core::limits::{MARKER_PREFIX, MAX_HANDLES};
+use sacredarts_core::limits::MARKER_PREFIX;
 use sacredarts_core::{Dirfd, OpenFlag, SyscallRequest, ValidationError};
 use std::ffi::CString;
 use std::os::fd::RawFd;
@@ -26,6 +27,8 @@ pub struct Runner {
     /// resolve against it (used only to label handles).
     cwd: PathBuf,
     handles: HandleTable,
+    /// The runner's socket to the supervisor (see `main.rs`).
+    ipc_fd: RawFd,
 }
 
 type Stop = ValidationError;
@@ -53,12 +56,68 @@ fn flag_bits(f: OpenFlag) -> libc::c_int {
         OpenFlag::O_RDWR => libc::O_RDWR,
         OpenFlag::O_CREAT => libc::O_CREAT,
         OpenFlag::O_EXCL => libc::O_EXCL,
+        OpenFlag::O_NOCTTY => libc::O_NOCTTY,
         OpenFlag::O_TRUNC => libc::O_TRUNC,
         OpenFlag::O_APPEND => libc::O_APPEND,
+        OpenFlag::O_NONBLOCK => libc::O_NONBLOCK,
+        OpenFlag::O_NDELAY => libc::O_NDELAY,
+        OpenFlag::O_DSYNC => libc::O_DSYNC,
+        OpenFlag::O_SYNC => libc::O_SYNC,
+        OpenFlag::O_RSYNC => libc::O_RSYNC,
+        OpenFlag::O_ASYNC => libc::O_ASYNC,
+        OpenFlag::O_DIRECT => libc::O_DIRECT,
+        OpenFlag::O_LARGEFILE => libc::O_LARGEFILE,
         OpenFlag::O_DIRECTORY => libc::O_DIRECTORY,
         OpenFlag::O_NOFOLLOW => libc::O_NOFOLLOW,
+        OpenFlag::O_NOATIME => libc::O_NOATIME,
         OpenFlag::O_CLOEXEC => libc::O_CLOEXEC,
+        OpenFlag::O_PATH => libc::O_PATH,
+        OpenFlag::O_TMPFILE => libc::O_TMPFILE,
     }
+}
+
+/// Decode open flags the way strace prints them: the access mode, then the
+/// named bits (multi-bit flags such as O_TMPFILE and O_SYNC first), then any
+/// remaining bits in hex.
+pub fn decode_flags(bits: libc::c_int) -> String {
+    let mut parts = vec![match bits & libc::O_ACCMODE {
+        libc::O_RDONLY => "O_RDONLY".to_string(),
+        libc::O_WRONLY => "O_WRONLY".to_string(),
+        libc::O_RDWR => "O_RDWR".to_string(),
+        m => format!("{m:#x}"),
+    }];
+    let mut rest = bits & !libc::O_ACCMODE;
+    // Aliases (O_NDELAY, O_RSYNC) are left out; O_SYNC/O_TMPFILE contain other bits.
+    let order = [
+        OpenFlag::O_TMPFILE,
+        OpenFlag::O_SYNC,
+        OpenFlag::O_CREAT,
+        OpenFlag::O_EXCL,
+        OpenFlag::O_NOCTTY,
+        OpenFlag::O_TRUNC,
+        OpenFlag::O_APPEND,
+        OpenFlag::O_NONBLOCK,
+        OpenFlag::O_DSYNC,
+        OpenFlag::O_ASYNC,
+        OpenFlag::O_DIRECT,
+        OpenFlag::O_LARGEFILE,
+        OpenFlag::O_DIRECTORY,
+        OpenFlag::O_NOFOLLOW,
+        OpenFlag::O_NOATIME,
+        OpenFlag::O_CLOEXEC,
+        OpenFlag::O_PATH,
+    ];
+    for f in order {
+        let v = flag_bits(f);
+        if v != 0 && rest & v == v {
+            parts.push(f.as_str().to_string());
+            rest &= !v;
+        }
+    }
+    if rest != 0 {
+        parts.push(format!("{rest:#x}"));
+    }
+    parts.join("|")
 }
 
 /// Convert a raw `syscall(2)` return into (ret, errno).
@@ -89,10 +148,11 @@ pub fn marker(kind: &str, id: u64) {
 }
 
 impl Runner {
-    pub fn new(cwd: &Path) -> Self {
+    pub fn new(cwd: &Path, ipc_fd: RawFd) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             handles: HandleTable::new(),
+            ipc_fd,
         }
     }
 
@@ -114,8 +174,9 @@ impl Runner {
                 dirfd,
                 path,
                 flags,
+                raw_flags,
                 mode,
-            } => self.openat(*dirfd, path, flags, *mode, &mut issued),
+            } => self.openat(*dirfd, path, flags, *raw_flags, *mode, &mut issued),
             SyscallRequest::Read { fd, count } => self.read(*fd, *count, &mut issued),
             SyscallRequest::Write { fd, data, count } => self.write(*fd, &data[..*count], &mut issued),
             SyscallRequest::Close { fd } => self.close(*fd, &mut issued),
@@ -148,7 +209,7 @@ impl Runner {
             purpose,
             args,
             ret: r.0,
-            errno: r.1.map(|e| errno::name(e).to_string()),
+            errno: r.1.map(errno::name),
         });
     }
 
@@ -159,25 +220,33 @@ impl Runner {
         Self::completed(r, std::mem::take(issued))
     }
 
-    fn handle_fd(&self, h: u32) -> Result<(RawFd, String), Stop> {
-        self.handles.get(h).map(|i| (i.real_fd, i.path.clone())).ok_or_else(|| {
-            reject(
-                "bad_handle",
+    /// Any fd goes to the kernel, except the runner's IPC socket: using it
+    /// would cut this session off from the supervisor.
+    fn fd(&self, fd: i32) -> Result<(RawFd, String), Stop> {
+        if fd == self.ipc_fd {
+            return Err(reject(
+                "reserved_fd",
                 format!(
-                    "handle {h} is not open in this session (Linux would report EBADF). \
-                     Learning handles are created by openat; see sandbox_inspect"
+                    "fd {fd} is the runner's socket to the SacredArts supervisor; using it would break this \
+                     session, so it is not passed to the kernel. Every other fd number is."
                 ),
-            )
-        })
+            ));
+        }
+        let shown = match self.handles.get(fd) {
+            Some(i) => format!("{fd}<{}>", i.path),
+            None => fd.to_string(),
+        };
+        Ok((fd, shown))
     }
 
-    /// The dirfd argument as passed to the kernel, plus a display label.
-    fn dirfd(&self, dirfd: Dirfd) -> Result<(RawFd, String, String), Stop> {
+    /// The dirfd argument as passed to the kernel, a display label, and the
+    /// directory path (if known) used to label the new fd.
+    fn dirfd(&self, dirfd: Dirfd) -> Result<(RawFd, String, Option<String>), Stop> {
         match dirfd {
-            Dirfd::AtFdcwd => Ok((libc::AT_FDCWD, "AT_FDCWD".into(), self.cwd.display().to_string())),
-            Dirfd::Handle(h) => {
-                let (fd, path) = self.handle_fd(h)?;
-                Ok((fd, format!("{fd}<{path}>"), path))
+            Dirfd::AtFdcwd => Ok((libc::AT_FDCWD, "AT_FDCWD".into(), Some(self.cwd.display().to_string()))),
+            Dirfd::Fd(n) => {
+                let (fd, shown) = self.fd(n)?;
+                Ok((fd, shown, self.handles.get(n).map(|i| i.path.clone())))
             }
         }
     }
@@ -187,50 +256,44 @@ impl Runner {
         dirfd: Dirfd,
         path: &str,
         flags: &[OpenFlag],
+        raw_flags: u32,
         mode: Option<u32>,
         issued: &mut Vec<IssuedCall>,
     ) -> Result<InvokeOutcome, Stop> {
-        if self.handles.is_full() {
-            return Err(reject(
-                "limit_exceeded",
-                format!("at most {MAX_HANDLES} handles may be open; close some first"),
-            ));
-        }
         let (fd, shown, base) = self.dirfd(dirfd)?;
         let c = cstring(path)?;
-        let bits = flags.iter().fold(0, |acc, f| acc | flag_bits(*f));
+        let bits = flags
+            .iter()
+            .fold(raw_flags as libc::c_int, |acc, f| acc | flag_bits(*f));
+        // Without a mode argument C passes whatever is in the register; we pass 0.
         let m = mode.unwrap_or(0);
-        // SAFETY: `c` is a valid NUL-terminated path; `fd` is AT_FDCWD or a
-        // descriptor owned by the handle table.
+        // SAFETY: `c` is a valid NUL-terminated path; the kernel validates `fd`.
         let r = result(unsafe { libc::syscall(libc::SYS_openat, fd, c.as_ptr(), bits, m as libc::c_uint) });
-        let mut args = format!("{shown}, {}, {}", quote_str(path), format_flags(flags));
-        if mode.is_some() {
+        let decoded = decode_flags(bits);
+        let mut args = format!("{shown}, {}, {decoded}", quote_str(path));
+        let uses_mode = bits & libc::O_CREAT != 0 || bits & libc::O_TMPFILE == libc::O_TMPFILE;
+        if mode.is_some() || uses_mode {
             args.push_str(&format!(", {}", format_mode(m)));
         }
         Self::issue(issued, "openat", IssuedPurpose::Requested, args, r);
 
         let mut out = Self::completed(r, std::mem::take(issued));
         if r.1.is_none() {
-            let real_fd = r.0 as RawFd;
-            match self.handles.insert(real_fd, label(&base, path), flags.to_vec()) {
-                Some(info) => {
-                    if let InvokeOutcome::Completed { handle_change, .. } = &mut out {
-                        *handle_change = Some(HandleChange::Opened { info });
-                    }
-                }
-                None => {
-                    // Unreachable in practice (checked above); never leak the fd.
-                    // SAFETY: real_fd was just opened by us and is not shared.
-                    unsafe { libc::syscall(libc::SYS_close_range, real_fd as u32, real_fd as u32, 0u32) };
-                    return Err(reject("limit_exceeded", "handle table is full"));
-                }
+            let new_fd = r.0 as RawFd;
+            let label = match base {
+                Some(b) => label(&b, path),
+                None => path.to_string(),
+            };
+            let info = self.handles.insert(new_fd, label, decoded);
+            if let InvokeOutcome::Completed { handle_change, .. } = &mut out {
+                *handle_change = Some(HandleChange::Opened { info });
             }
         }
         Ok(out)
     }
 
-    fn read(&mut self, h: u32, count: usize, issued: &mut Vec<IssuedCall>) -> Result<InvokeOutcome, Stop> {
-        let (fd, path) = self.handle_fd(h)?;
+    fn read(&mut self, fd: i32, count: usize, issued: &mut Vec<IssuedCall>) -> Result<InvokeOutcome, Stop> {
+        let (fd, shown_fd) = self.fd(fd)?;
         let mut buf = vec![0u8; count];
         // SAFETY: `buf` has exactly `count` writable bytes and outlives the call.
         let r = result(unsafe { libc::syscall(libc::SYS_read, fd, buf.as_mut_ptr(), count) });
@@ -243,7 +306,7 @@ impl Runner {
             issued,
             "read",
             IssuedPurpose::Requested,
-            format!("{fd}<{path}>, {shown}, {count}"),
+            format!("{shown_fd}, {shown}, {count}"),
             r,
         );
         let mut out = Self::completed(r, std::mem::take(issued));
@@ -255,28 +318,30 @@ impl Runner {
         Ok(out)
     }
 
-    fn write(&mut self, h: u32, data: &[u8], issued: &mut Vec<IssuedCall>) -> Result<InvokeOutcome, Stop> {
-        let (fd, path) = self.handle_fd(h)?;
+    fn write(&mut self, fd: i32, data: &[u8], issued: &mut Vec<IssuedCall>) -> Result<InvokeOutcome, Stop> {
+        let (fd, shown_fd) = self.fd(fd)?;
         // SAFETY: `data` is a valid readable slice for the duration of the call.
         let r = result(unsafe { libc::syscall(libc::SYS_write, fd, data.as_ptr(), data.len()) });
         Self::issue(
             issued,
             "write",
             IssuedPurpose::Requested,
-            format!("{fd}<{path}>, {}, {}", quote_bytes(data, DISPLAY_BYTES), data.len()),
+            format!("{shown_fd}, {}, {}", quote_bytes(data, DISPLAY_BYTES), data.len()),
             r,
         );
         // A short write is reported as-is; the runner never loops to "fix" it.
         Ok(Self::completed(r, std::mem::take(issued)))
     }
 
-    fn close(&mut self, h: u32, issued: &mut Vec<IssuedCall>) -> Result<InvokeOutcome, Stop> {
-        let (fd, path) = self.handle_fd(h)?;
-        // SAFETY: `fd` belongs to the handle table; on success we drop the entry.
+    fn close(&mut self, fd: i32, issued: &mut Vec<IssuedCall>) -> Result<InvokeOutcome, Stop> {
+        let (fd, shown) = self.fd(fd)?;
+        // SAFETY: closing an fd is memory-safe; the runner's own IPC socket is excluded above.
         let r = result(unsafe { libc::syscall(libc::SYS_close, fd) });
-        Self::issue(issued, "close", IssuedPurpose::Requested, format!("{fd}<{path}>"), r);
+        Self::issue(issued, "close", IssuedPurpose::Requested, shown, r);
         let gone = if r.1.is_none() {
             true
+        } else if self.handles.get(fd).is_none() {
+            false
         } else {
             // On Linux close() releases the fd even when it reports an error,
             // except when the syscall never ran (e.g. denied by seccomp).
@@ -294,7 +359,7 @@ impl Runner {
         };
         let mut out = Self::completed(r, std::mem::take(issued));
         if gone
-            && let Some(info) = self.handles.remove(h)
+            && let Some(info) = self.handles.remove(fd)
             && let InvokeOutcome::Completed { handle_change, .. } = &mut out
         {
             *handle_change = Some(HandleChange::Closed { info });
@@ -311,7 +376,7 @@ impl Runner {
     ) -> Result<InvokeOutcome, Stop> {
         let (fd, shown, _) = self.dirfd(dirfd)?;
         let c = cstring(path)?;
-        // SAFETY: `c` is a valid NUL-terminated path; `fd` is AT_FDCWD or a valid dirfd.
+        // SAFETY: `c` is a valid NUL-terminated path; the kernel validates `fd`.
         let r = result(unsafe { libc::syscall(libc::SYS_mkdirat, fd, c.as_ptr(), mode as libc::c_uint) });
         Self::issue(
             issued,

@@ -1,7 +1,7 @@
 //! SacredArts syscall runner.
 //!
 //! The runner is a long-lived process inside the sandbox container. It keeps
-//! learning handles (file descriptors) across requests, so that
+//! its open file descriptors across requests, so that
 //! `openat -> write -> close` issued as separate MCP tool calls operate on the
 //! same kernel file description.
 //!

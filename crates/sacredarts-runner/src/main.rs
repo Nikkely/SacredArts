@@ -3,6 +3,8 @@
 //! fd 0 must be a connected AF_UNIX stream socket to the supervisor.
 //! Start-up order matters because seccomp filters are irreversible:
 //!
+//! 0. move the socket to the highest allowed fd and put /dev/null on fd 0, so
+//!    fds 0-2 look like any process's stdio and new files start at fd 3
 //! 1. cache the pid (the policy may deny `getpid`)
 //! 2. install the seccomp filter (if the policy is non-empty)
 //! 3. emit the `ready` marker and send the hello line
@@ -49,6 +51,35 @@ mod linux {
         Ok(Args { workspace, policy })
     }
 
+    /// Move the supervisor socket from fd 0 to the top of the fd range
+    /// (RLIMIT_NOFILE - 1) and replace fd 0 with /dev/null. Returns the
+    /// socket's fd (0 if it could not be moved).
+    fn move_ipc_socket() -> i32 {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into `lim`.
+        let top = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+            lim.rlim_cur.min(1 << 20) as i32 - 1
+        } else {
+            255
+        };
+        // SAFETY: plain fd duplication / replacement on fds this process owns.
+        unsafe {
+            let fd = libc::fcntl(0, libc::F_DUPFD_CLOEXEC, top.max(3));
+            if fd < 0 {
+                return 0;
+            }
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+            if null >= 0 {
+                libc::dup2(null, 0);
+                libc::close(null);
+            }
+            fd
+        }
+    }
+
     pub fn run() -> i32 {
         let args = match parse_args() {
             Ok(a) => a,
@@ -60,7 +91,8 @@ mod linux {
         // The working directory is set by the supervisor; relative paths with
         // AT_FDCWD resolve against it, exactly as for any Linux process.
         let cwd = std::env::current_dir().unwrap_or_else(|_| args.workspace.clone());
-        let mut runner = Runner::new(&cwd);
+        let ipc_fd = move_ipc_socket();
+        let mut runner = Runner::new(&cwd, ipc_fd);
         // SAFETY: getpid has no preconditions. Cached before seccomp because the
         // policy may deny getpid.
         let pid = unsafe { libc::syscall(libc::SYS_getpid) } as i32;
@@ -71,7 +103,7 @@ mod linux {
                 return 1;
             }
         };
-        let mut io = SockIo::new(0);
+        let mut io = SockIo::new(ipc_fd);
         marker("ready", 0);
         let hello = RunnerHello {
             pid,

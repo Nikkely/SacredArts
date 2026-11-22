@@ -1,64 +1,64 @@
 
 >>> sandbox_create {"guide_level": 1}
-Sandbox ready: session_id=daa64e47-e4fe-48b8-9b57-bf1377d4454f arch=aarch64 guide_level=1 trace_mode=Requested policy.deny=[]
-workspace: /workspace (cwd), runner pid 14 (container PID namespace)
+Sandbox ready: session_id=6eec9b4c-fbb8-4c7d-9136-7310deb39b7e arch=aarch64 guide_level=1 trace_mode=Requested policy.deny=[]
+workspace: /workspace (cwd), runner pid 13 (container PID namespace)
 
->>> syscall_invoke {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "name": "openat", "args": {"path": "/workspace/hello.txt", "flags": ["O_CREAT", "O_WRONLY"], "mode": "0644"}}
+>>> syscall_invoke {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "name": "openat", "args": {"path": "/workspace/hello.txt", "flags": ["O_CREAT", "O_WRONLY"], "mode": "0644"}}
 openat(AT_FDCWD, "/workspace/hello.txt", O_WRONLY|O_CREAT, 0644) = 3
 
->>> syscall_invoke {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "name": "write", "args": {"fd": 3, "data": "Hello"}}
+>>> syscall_invoke {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "name": "write", "args": {"fd": 3, "data": "Hello"}}
 write(3, "Hello", 5) = 5
 
->>> syscall_invoke {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "name": "close", "args": {"fd": 3}}
+>>> syscall_invoke {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "name": "close", "args": {"fd": 3}}
 close(3) = 0
 
->>> session_set_guide {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "guide_level": 2, "trace_mode": "all"}
-guide_level=2 trace_mode=All (runner pid 14 generation 1 unchanged; handles kept)
+>>> session_set_guide {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "guide_level": 2, "trace_mode": "all"}
+guide_level=2 trace_mode=All (runner pid 13 generation 1 unchanged; fds kept)
 
->>> syscall_invoke {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "name": "openat", "args": {"path": "hello.txt"}}
+>>> syscall_invoke {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "name": "openat", "args": {"path": "hello.txt"}}
 openat(AT_FDCWD, "hello.txt", O_RDONLY) = 3
 # kernel (strace):
-  openat(AT_FDCWD</workspace>, "hello.txt", O_RDONLY) = 3</workspace/hello.txt> <0.000038>
+  openat(AT_FDCWD</workspace>, "hello.txt", O_RDONLY) = 3</workspace/hello.txt> <0.000027>
 
 解説:
 openat はファイルを開くためのシステムコールです。成功するとファイルディスクリプタ（fd）という番号が返り、
 以降の read・write・close ではこの番号でファイルを指定します。
 
 今回は `hello.txt` をオープンし、読み込み専用で利用できる状態にしています。
-戻り値の `3` はファイルディスクリプタです（SacredArts の学習用ハンドル。カーネル上の実際の fd は 3）。
+戻り値の `3` はファイルディスクリプタです（カーネルが返した値そのもの）。
 以降の read・write・close ではこの `3` を指定します。
 
->>> syscall_invoke {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "name": "read", "args": {"fd": 3, "count": 64}}
+>>> syscall_invoke {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "name": "read", "args": {"fd": 3, "count": 64}}
 read(3, "Hello", 64) = 5
 # kernel (strace):
-  read(3</workspace/hello.txt>, "Hello", 64) = 5 <0.000040>
+  read(3</workspace/hello.txt>, "Hello", 64) = 5 <0.000002>
 
 解説:
 read は、fd が指すファイルから最大 count バイトを読み込むシステムコールです。
 戻り値は実際に読めたバイト数で、ファイルの終わり（EOF）では 0 になります。
 
-ハンドル `3` から最大 64 バイトを要求し、実際には `5` バイト読めました。要求より少ない部分読み込みです（エラーではありません）。通常ファイルでは、一般にファイルの残りがそれだけだったことを意味します。
+fd `3` から最大 64 バイトを要求し、実際には `5` バイト読めました。要求より少ない部分読み込みです（エラーではありません）。通常ファイルでは、一般にファイルの残りがそれだけだったことを意味します。
 ファイルオフセットは読んだ分だけ進んだので、次の read は続きから読みます。
 
->>> sandbox_inspect {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f"}
-session daa64e47-e4fe-48b8-9b57-bf1377d4454f
-runner pid 14 (generation 1), cwd /workspace
+>>> sandbox_inspect {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e"}
+session 6eec9b4c-fbb8-4c7d-9136-7310deb39b7e
+runner pid 13 (generation 1), cwd /workspace
 policy deny=[] errno=EPERM; seccomp mode=2 filters=1 (Docker's default profile counts as one filter)
 guide_level=2 trace_mode=all
-open handles:
-  handle 3 -> real fd 3  /workspace/hello.txt  [O_RDONLY]
+open fds:
+  fd 3  /workspace/hello.txt  [O_RDONLY]
 /workspace:
   hello.txt (file, 5 bytes)
 events: 12
 
->>> policy_set {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "deny": ["mkdirat"], "errno": "EPERM"}
-Policy applied: deny=["mkdirat"] errno=EPERM. Runner recreated (generation 1 -> 2, pid 21); all handles were closed (state_reset: true).
+>>> policy_set {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "deny": ["mkdirat"], "errno": "EPERM"}
+Policy applied: deny=["mkdirat"] errno=EPERM. Runner recreated (generation 1 -> 2, pid 20); all fds were closed (state_reset: true).
 seccomp: mode=2 filters=2 (Docker's default profile counts as one filter)
 
->>> syscall_invoke {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "name": "mkdirat", "args": {"path": "test", "mode": "0755"}}
+>>> syscall_invoke {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "name": "mkdirat", "args": {"path": "test", "mode": "0755"}}
 mkdirat(AT_FDCWD, "test", 0755) = -1 EPERM (Operation not permitted)
 # kernel (strace):
-  mkdirat(AT_FDCWD</workspace>, "test", 0755) = -1 EPERM (Operation not permitted) <0.000023>
+  mkdirat(AT_FDCWD</workspace>, "test", 0755) = -1 EPERM (Operation not permitted) <0.000031>
 
 解説:
 mkdirat は新しいディレクトリを作るシステムコールです。成功すると 0 を返します。
@@ -67,33 +67,33 @@ dirfd を基準に相対パスを解決できる点が mkdir との違いです�
 `test` を作成できませんでした。エラーは `EPERM`（Operation not permitted）です。
 これはファイルシステムの問題ではありません。現在のポリシーで mkdirat が deny されているため、カーネルの seccomp フィルタが mkdirat の実行前に EPERM を返しました。
 
->>> policy_set {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "deny": []}
-Policy applied: deny=[] errno=EPERM. Runner recreated (generation 2 -> 3, pid 28); all handles were closed (state_reset: true).
+>>> policy_set {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "deny": []}
+Policy applied: deny=[] errno=EPERM. Runner recreated (generation 2 -> 3, pid 27); all fds were closed (state_reset: true).
 seccomp: mode=2 filters=1 (Docker's default profile counts as one filter)
 
->>> session_set_guide {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "guide_level": 1}
-guide_level=1 trace_mode=All (runner pid 28 generation 3 unchanged; handles kept)
+>>> session_set_guide {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "guide_level": 1}
+guide_level=1 trace_mode=All (runner pid 27 generation 3 unchanged; fds kept)
 
->>> syscall_invoke {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "name": "mkdirat", "args": {"path": "test", "mode": "0755"}}
+>>> syscall_invoke {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "name": "mkdirat", "args": {"path": "test", "mode": "0755"}}
 mkdirat(AT_FDCWD, "test", 0755) = 0
 # kernel (strace):
-  mkdirat(AT_FDCWD</workspace>, "test", 0755) = 0 <0.000028>
+  mkdirat(AT_FDCWD</workspace>, "test", 0755) = 0 <0.000057>
 
->>> trace_get {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f", "limit": 12}
+>>> trace_get {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e", "limit": 12}
 trace_mode=All, 12 event(s)
 #1 lifecycle - [sandbox_created]
 #2 requested req-1 openat(AT_FDCWD, "/workspace/hello.txt", O_WRONLY|O_CREAT, 0644) = 3
-#3 observed  req-1 openat(AT_FDCWD</workspace>, "/workspace/hello.txt", O_WRONLY|O_CREAT, 0644) = 3</workspace/hello.txt> <0.000055>
+#3 observed  req-1 openat(AT_FDCWD</workspace>, "/workspace/hello.txt", O_WRONLY|O_CREAT, 0644) = 3</workspace/hello.txt> <0.000046>
 #4 requested req-2 write(3, "Hello", 5) = 5
-#5 observed  req-2 write(3</workspace/hello.txt>, "Hello", 5) = 5 <0.000051>
+#5 observed  req-2 write(3</workspace/hello.txt>, "Hello", 5) = 5 <0.000033>
 #6 requested req-3 close(3) = 0
-#7 observed  req-3 close(3</workspace/hello.txt>) = 0 <0.000044>
+#7 observed  req-3 close(3</workspace/hello.txt>) = 0 <0.000022>
 #8 lifecycle - [guide_changed]
 #9 requested req-4 openat(AT_FDCWD, "hello.txt", O_RDONLY) = 3
-#10 observed  req-4 openat(AT_FDCWD</workspace>, "hello.txt", O_RDONLY) = 3</workspace/hello.txt> <0.000038>
+#10 observed  req-4 openat(AT_FDCWD</workspace>, "hello.txt", O_RDONLY) = 3</workspace/hello.txt> <0.000027>
 #11 requested req-5 read(3, "Hello", 64) = 5
-#12 observed  req-5 read(3</workspace/hello.txt>, "Hello", 64) = 5 <0.000040>
+#12 observed  req-5 read(3</workspace/hello.txt>, "Hello", 64) = 5 <0.000002>
 (more: call again with after_event_id=12)
 
->>> sandbox_destroy {"session_id": "daa64e47-e4fe-48b8-9b57-bf1377d4454f"}
-daa64e47-e4fe-48b8-9b57-bf1377d4454f: destroyed
+>>> sandbox_destroy {"session_id": "6eec9b4c-fbb8-4c7d-9136-7310deb39b7e"}
+6eec9b4c-fbb8-4c7d-9136-7310deb39b7e: destroyed

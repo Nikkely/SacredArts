@@ -339,7 +339,10 @@ fn t06_strace_observation() {
     assert_eq!(req.len(), 1);
     assert!(!seen.is_empty());
     assert_eq!(req[0]["source"], "ai_request");
-    assert_eq!(req[0]["return_value"], 3, "requested event shows the learning handle");
+    assert_eq!(
+        req[0]["return_value"], 3,
+        "requested event shows the fd the kernel returned"
+    );
     assert_eq!(req[0]["details"]["kernel_return_value"], real_fd);
     assert!(req[0]["duration_ns"].is_null(), "not measured -> null");
     for s in &seen {
@@ -438,6 +441,21 @@ fn t07_seccomp() {
     // invalid policies are rejected and do not touch the session
     m.tool("policy_set", json!({"session_id": sid, "deny": ["sendto"]}))
         .err("unsupported_syscall");
+    // any errno name works; an unknown one fails inside the sandbox and the old policy stays
+    m.tool(
+        "policy_set",
+        json!({"session_id": sid, "deny": ["getpid"], "errno": "EIO"}),
+    )
+    .ok();
+    let g = m.invoke(&sid, "getpid", json!({})).ok();
+    assert_eq!(g.v["errno"]["name"], "EIO");
+    let e = m.tool(
+        "policy_set",
+        json!({"session_id": sid, "deny": ["getpid"], "errno": "ENOTANERRNO"}),
+    );
+    assert!(e.is_error, "{}", e.text);
+    let g = m.invoke(&sid, "getpid", json!({})).ok();
+    assert_eq!(g.v["errno"]["name"], "EIO", "previous policy still active");
     m.tool("sandbox_destroy", json!({"session_id": sid})).ok();
     m.shutdown();
 }
@@ -449,9 +467,10 @@ fn t08_errors() {
     preflight();
     let mut m = Mcp::start(&[("SACREDARTS_REQUEST_TIMEOUT_MS", "1500")]);
     let sid = m.create(json!({}));
-    // invalid fd
-    let e = m.invoke(&sid, "close", json!({"fd": 99})).err("bad_handle");
-    assert_eq!(e.v["error"]["kind"], "invalid_argument");
+    // invalid fd: the kernel answers EBADF (a Linux error, not a tool error)
+    let r = m.invoke(&sid, "close", json!({"fd": 99})).ok();
+    assert_eq!(r.v["success"], false);
+    assert_eq!(r.v["errno"]["name"], "EBADF");
     // invalid argument
     m.invoke(
         &sid,
@@ -560,6 +579,21 @@ fn t09_isolation() {
         None,
         "tmpfs is writable"
     );
+    // fds, flags and limits are the kernel's
+    let r = m.invoke(&sid, "read", json!({"fd": 0, "count": 1})).ok();
+    assert_eq!(r.v["return_value"], 0, "fd 0 is /dev/null");
+    let r = m
+        .invoke(
+            &sid,
+            "openat",
+            json!({"path": "/tmp", "flags": "O_RDWR|O_TMPFILE", "mode": "0600"}),
+        )
+        .ok();
+    assert_eq!(r.v["success"], true, "O_TMPFILE on tmpfs: {:?}", r.v);
+    let fd = r.v["return_value"].as_i64().unwrap();
+    m.invoke(&sid, "close", json!({"fd": fd})).ok();
+    let r = m.invoke(&sid, "openat", json!({"path": "x".repeat(5000)})).ok();
+    assert_eq!(r.v["errno"]["name"], "ENAMETOOLONG");
     // the request reaches the kernel verbatim
     let r = m.invoke(&sid, "openat", json!({"path": "/proc/self/status"})).ok();
     let issued = r.v["kernel"]["runner_issued"].as_array().unwrap();

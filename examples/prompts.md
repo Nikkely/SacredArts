@@ -16,7 +16,7 @@ SacredArts は **呪文で起動** します。メッセージに「System Call�
 ## 観測（Observation）
 
 4. 「System Call. trace_mode を all にして hello.txt を読み、AI が要求した syscall とカーネルが実際に受け取った syscall の違いを説明して。」
-   - AI の要求（学習用ハンドル）と、strace が独立に観測したカーネル側の呼び出し（実 fd とそのパス）が並んで見えます。
+   - AI の要求（fd）と、strace が独立に観測したカーネル側の呼び出し（実 fd とそのパス）が並んで見えます。
 5. 「System Call. これまでの trace_get の結果を requested と observed に分けて表にして。」
 
 ## 制御（Control）

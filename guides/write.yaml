@@ -62,7 +62,7 @@ man_pages:
   - fsync(2)
 explain:
   success: |
-    ハンドル `{fd}` に {count} バイトを要求し、`{ret}` バイト書き込めました。{partial_note}
+    fd `{fd}` に {count} バイトを要求し、`{ret}` バイト書き込めました。{partial_note}
   failure: |
     write が `{errno}`（{errno_message}）で失敗しました。
 notes:

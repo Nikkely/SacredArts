@@ -46,8 +46,8 @@ Docker Desktop (Linux VM) ── Sandbox Container (1 session = 1 container, Ubu
    docker-init (PID 1)
     └─ sacredarts-supervisor        … IPC with the host; starts/monitors/recreates the runner; splits strace output
         └─ strace -ttt -T -y        … observes real syscalls (writes to a FIFO)
-            └─ sacredarts-runner    … long-lived; executes syscalls, learning-handle table, applies seccomp
-                 fd 0 = AF_UNIX socket (sendto/recvfrom)
+            └─ sacredarts-runner    … long-lived; executes syscalls, applies seccomp
+                 fd 255 = AF_UNIX socket to the supervisor (sendto/recvfrom); fd 0 = /dev/null
 ```
 
 Key design decisions (details in [docs/architecture.md](docs/architecture.md), Japanese):
@@ -55,8 +55,8 @@ Key design decisions (details in [docs/architecture.md](docs/architecture.md), J
 - **IPC uses the container's stdin/stdout.** No ports are published. If the MCP server exits or crashes, stdin closes, the container exits by itself and `--rm` removes it.
 - **The runner talks over `sendto`/`recvfrom`.** Denying `read`/`write`/`close` with a policy never breaks the runner's own communication.
 - **Observations are attributed with marker syscalls.** Before and after each request the runner issues `faccessat` on a non-existent path; the supervisor cuts the strace output at those markers.
-- **Learning handles.** The fd returned to the AI is a virtual handle (lowest free number ≥ 3), separate from the runner's real fds. The mapping to real fds is shown in responses, `trace_get` and `sandbox_inspect`.
-- **Paths are passed to the kernel verbatim.** SacredArts does not confine or rewrite them; the container is the safety boundary.
+- **Arguments are passed to the kernel verbatim.** Paths, fd numbers, every `O_*` flag (or raw numbers), and modes (including setuid/sticky bits) go to the kernel unchanged, so `EBADF`, `EMFILE`, `ENAMETOOLONG`, `EROFS` and friends come from the kernel itself. The container is the safety boundary. The only fd that is refused is the runner's own socket to the supervisor (`reserved_fd`).
+- **No hand-written tables for errno.** errno names (both directions) come from glibc's `strerrorname_np`, so every errno is shown by name and any errno name can be used in a policy.
 
 ## Requirements
 
@@ -145,7 +145,7 @@ The AI starts the sandbox itself via `sandbox_create`. All you need is Docker De
 | `syscall_describe` | Describe a syscall (no sandbox needed; also explains `open` vs `openat`) |
 | `trace_get` | Event history (requested / observed / lifecycle). Paging via `after_event_id` |
 | `policy_set` | Change the seccomp deny policy (recreates the runner; `state_reset: true`) |
-| `sandbox_inspect` | Runner PID, learning handles (→ real fds), working directory, policy, seccomp state, guide level, etc. |
+| `sandbox_inspect` | Runner PID, fds opened in the session (with paths), working directory, policy, seccomp state, guide level, etc. |
 | `sandbox_destroy` | Stop the runner, remove the container, forget the session (idempotent) |
 | `session_set_guide` | Change the guide level (and optionally trace_mode). Does not recreate the runner |
 
@@ -175,19 +175,18 @@ See [docs/tools.md](docs/tools.md) (Japanese) for full inputs and outputs.
 Level 3 separates "what was measured this time" from "general Linux behavior" under distinct headings, and states explicitly that kernel internals (VFS etc.) are not observed.
 Details: [docs/guide-mode.md](docs/guide-mode.md) (Japanese). Explanations are currently written in Japanese.
 
-> **Note:** the `= 3` shown at Level 1 etc. is a **SacredArts learning handle**, not a raw fd.
-> The fd the kernel actually returned is in `handle.real_fd`, `kernel.return_value` and the strace observation (e.g. `= 3</workspace/hello.txt>`).
+> **Note:** the `= 3` shown at Level 1 etc. is the real fd the kernel returned. fds 0–2 are taken (fd 0/1 are `/dev/null`, fd 2 is the runner's stderr), so the first file is 3 like in any process.
 
 ## Supported syscalls
 
 | syscall | args | Notes |
 |---|---|---|
 | `getpid` | none | PID in the container's PID namespace |
-| `openat` | `dirfd?` (`"AT_FDCWD"` or a handle), `path`, `flags?` (array or `"O_A\|O_B"`, default `O_RDONLY`), `mode?` (`"0644"`, required with `O_CREAT`) | Flags: `O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_TRUNC O_APPEND O_DIRECTORY O_NOFOLLOW O_CLOEXEC`. Returns a learning handle |
-| `read` | `fd`, `count` (0–65536) | `data_text` (when valid UTF-8) and `data_base64` |
+| `openat` | `dirfd?` (`"AT_FDCWD"` or any fd), `path`, `flags?` (array, `"O_A\|O_B\|0x80000"` or an integer; default `O_RDONLY`), `mode?` (`"0644"` or an integer; 0 if omitted) | Every Linux `O_*` flag (incl. `O_PATH`, `O_TMPFILE`, `O_NONBLOCK`, `O_SYNC`, `O_DIRECT`) plus raw bits. Returns the kernel's fd |
+| `read` | `fd` (any int), `count` (0–65536) | `data_text` (when valid UTF-8) and `data_base64` |
 | `write` | `fd`, `data`, `encoding?` (`utf8`/`base64`), `count?` | Short writes are reported as-is |
-| `close` | `fd` | |
-| `mkdirat` | `dirfd?`, `path`, `mode?` (default `"0755"`) | |
+| `close` | `fd` (any int) | |
+| `mkdirat` | `dirfd?`, `path`, `mode?` (default `"0755"`; any bits) | |
 | `open` | — (`syscall_describe` only) | For explaining `open` vs `openat` |
 
 The working directory is `/workspace`. Paths are not restricted and go to the kernel as written, so you can open `/etc/passwd` and the like (files inside the container).
@@ -209,7 +208,7 @@ write(3, "Hello", 5) = 5
 close(3) = 0
 
 >>> session_set_guide {"guide_level": 2, "trace_mode": "all"}
-guide_level=2 trace_mode=All (runner pid 13 generation 1 unchanged; handles kept)
+guide_level=2 trace_mode=All (runner pid 13 generation 1 unchanged; fds kept)
 
 >>> syscall_invoke {"name": "read", "args": {"fd": 3, "count": 64}}
 read(3, "Hello", 64) = 5
@@ -221,7 +220,7 @@ read は、fd が指すファイルから最大 count バイトを読み込む�
 ...
 
 >>> policy_set {"deny": ["mkdirat"], "errno": "EPERM"}
-Policy applied: deny=["mkdirat"] errno=EPERM. Runner recreated (generation 1 -> 2, pid 20); all handles were closed (state_reset: true).
+Policy applied: deny=["mkdirat"] errno=EPERM. Runner recreated (generation 1 -> 2, pid 20); all fds were closed (state_reset: true).
 seccomp: mode=2 filters=2 (Docker's default profile counts as one filter)
 
 >>> syscall_invoke {"name": "mkdirat", "args": {"path": "test", "mode": "0755"}}
@@ -236,7 +235,7 @@ mkdirat(AT_FDCWD, "test", 0755) = -1 EPERM (Operation not permitted)
 #5 observed  req-2 write(3</workspace/hello.txt>, "Hello", 5) = 5 <0.000051>
 ```
 
-`requested` is the AI's request (learning handle 3); `observed` is the call that strace independently saw reach the kernel (real fd and its path).
+`requested` is the AI's request (fd 3); `observed` is the call that strace independently saw reach the kernel (real fd and its path).
 Because SacredArts does not rewrite paths or flags, the two are two views of the same syscall. Full output: [examples/demo-output.txt](examples/demo-output.txt).
 
 ## Sample prompts
@@ -254,7 +253,7 @@ More in [examples/prompts.md](examples/prompts.md) (Japanese).
 ```sh
 make lint                                 # rustfmt --check and clippy (warnings are errors)
 cargo test --workspace                    # macOS: unit tests for types, validation, parser, guides, event store
-scripts/linux-test.sh                     # Linux tests in Docker: runner (seccomp, paths, handles) etc.
+scripts/linux-test.sh                     # Linux tests in Docker: runner (seccomp, paths, fds, flags) etc.
 docker build -t sacredarts-sandbox:0.1.0 .
 cargo test -p sacredarts-mcp --test acceptance -- --ignored --test-threads=1   # acceptance tests (Docker required)
 ```
@@ -280,7 +279,7 @@ Out of scope for now: arbitrary syscall numbers, arbitrary memory access, arbitr
 
 Known limitations:
 
-- amd64 (x86_64) is compile-checked only; running on real amd64 Linux / Intel Macs is unverified
+- amd64 (x86_64): all tests, including the Docker acceptance tests, pass on Linux in CI (GitHub Actions); Intel Macs are unverified
 - Observation is via strace; kernel internals are not observed
 - Guide explanations are in Japanese only
 

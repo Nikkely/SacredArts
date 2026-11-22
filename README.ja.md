@@ -46,8 +46,8 @@ Docker Desktop (Linux VM) ── Sandbox Container (1 セッション = 1 コン
    docker-init (PID 1)
     └─ sacredarts-supervisor        … ホストとの IPC、Runner の起動・監視・再作成、strace 出力の切り分け
         └─ strace -ttt -T -y        … 実 syscall の観測（FIFO へ出力）
-            └─ sacredarts-runner    … 常駐。syscall 実行、学習用ハンドル表、seccomp 適用
-                 fd 0 = AF_UNIX ソケット（sendto/recvfrom で通信）
+            └─ sacredarts-runner    … 常駐。syscall 実行、seccomp 適用
+                 fd 255 = supervisor への AF_UNIX ソケット（sendto/recvfrom）、fd 0 = /dev/null
 ```
 
 主な設計判断（詳細は [docs/architecture.md](docs/architecture.md)）:
@@ -55,7 +55,8 @@ Docker Desktop (Linux VM) ── Sandbox Container (1 セッション = 1 コン
 - **IPC はコンテナの stdin/stdout**。ホストにポートを公開せず、MCP サーバーが終了・クラッシュすると stdin が閉じてコンテナは自ら終了し `--rm` で削除されます。
 - **Runner の内部通信は `sendto`/`recvfrom`**。ポリシーで `read`/`write`/`close` を禁止しても Runner の通信は壊れません。
 - **観測の対応付けはマーカー syscall**。Runner は各要求の前後に存在しないパスへの `faccessat` を発行し、Supervisor は strace 出力をその区間で切り出します。
-- **学習用ハンドル**。AI に返す fd は Runner 内の実 fd と分離された仮想ハンドル（3 以上の空き最小番号）です。実 fd との対応は応答・`trace_get`・`sandbox_inspect` で確認できます。
+- **引数はそのままカーネルへ**。パス、fd 番号、Linux の全 `O_*` フラグ（数値も可）、mode（setuid・sticky ビットも含む）を書き換えずに渡すので、`EBADF`・`EMFILE`・`ENAMETOOLONG`・`EROFS` などはカーネル自身が返します。安全の境界はコンテナです。拒否する fd は Runner と supervisor をつなぐソケット 1 本だけ（`reserved_fd`）です。
+- **errno の手書きの表は持たない**。errno の名前と番号の変換は glibc の `strerrorname_np` を使うので、すべての errno が名前で表示され、ポリシーにはどの errno 名でも指定できます。
 
 ## 必要条件
 
@@ -143,7 +144,7 @@ System Call. hello.txt を作って Hello と書いて、ガイドレベル 2 �
 | `syscall_describe` | syscall の仕様（サンドボックス不要。`open` と `openat` の違いも説明） |
 | `trace_get` | イベント履歴（requested / observed / lifecycle）。`after_event_id` でページング |
 | `policy_set` | seccomp 拒否ポリシーを変更（Runner を再作成。`state_reset: true`） |
-| `sandbox_inspect` | Runner PID、学習用ハンドル（→実 fd）、作業ディレクトリ、ポリシー、seccomp 状態、ガイドレベル等 |
+| `sandbox_inspect` | Runner PID、セッションで開いた fd（パス付き）、作業ディレクトリ、ポリシー、seccomp 状態、ガイドレベル等 |
 | `sandbox_destroy` | Runner 終了・コンテナ削除・セッション削除（冪等） |
 | `session_set_guide` | ガイドレベル（と任意で trace_mode）を変更。Runner は再作成しない |
 
@@ -173,19 +174,18 @@ System Call. hello.txt を作って Hello と書いて、ガイドレベル 2 �
 Level 3 では「今回実測したこと」と「Linux の一般的な仕様」を見出しで分け、カーネル内部（VFS 等）は観測していないことを明記します。
 詳しくは [docs/guide-mode.md](docs/guide-mode.md)。
 
-> **注意:** Level 1 などで表示される `= 3` は **SacredArts の学習用ハンドル** です（実 fd ではありません）。
-> カーネルが実際に返した fd は `handle.real_fd`、`kernel.return_value`、strace の観測（`= 3</workspace/hello.txt>` など）で確認できます。
+> **補足:** Level 1 などで表示される `= 3` はカーネルが返した本物の fd です。fd 0〜2 は埋まっている（0 と 1 は `/dev/null`、2 は Runner の stderr）ので、普通のプロセスと同じく最初のファイルは 3 になります。
 
 ## 対応 syscall
 
 | syscall | args | 備考 |
 |---|---|---|
 | `getpid` | なし | コンテナの PID 名前空間での PID |
-| `openat` | `dirfd?`（`"AT_FDCWD"` か ハンドル）, `path`, `flags?`（配列 or `"O_A\|O_B"`、既定 `O_RDONLY`）, `mode?`（`"0644"`、`O_CREAT` 時は必須） | フラグ: `O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_TRUNC O_APPEND O_DIRECTORY O_NOFOLLOW O_CLOEXEC`。学習用ハンドルを返す |
-| `read` | `fd`, `count`（0〜65536） | `data_text`（UTF-8 のとき）と `data_base64` |
+| `openat` | `dirfd?`（`"AT_FDCWD"` か任意の fd）, `path`, `flags?`（配列・`"O_A\|O_B\|0x80000"`・整数。既定 `O_RDONLY`）, `mode?`（`"0644"` か整数。省略時 0） | Linux の全 `O_*` フラグ（`O_PATH`、`O_TMPFILE`、`O_NONBLOCK`、`O_SYNC`、`O_DIRECT` なども）と数値のビット。カーネルが返した fd を返す |
+| `read` | `fd`（任意の整数）, `count`（0〜65536） | `data_text`（UTF-8 のとき）と `data_base64` |
 | `write` | `fd`, `data`, `encoding?`（`utf8`/`base64`）, `count?` | 部分書き込みはそのまま返す |
-| `close` | `fd` | |
-| `mkdirat` | `dirfd?`, `path`, `mode?`（既定 `"0755"`） | |
+| `close` | `fd`（任意の整数） | |
+| `mkdirat` | `dirfd?`, `path`, `mode?`（既定 `"0755"`。どのビットも可） | |
 | `open` | —（`syscall_describe` のみ） | `open` と `openat` の違いの説明用 |
 
 カレントディレクトリは `/workspace` です。パスは制限せずそのままカーネルに渡すので、`/etc/passwd` なども開けます（コンテナ内のファイルです）。
@@ -207,7 +207,7 @@ write(3, "Hello", 5) = 5
 close(3) = 0
 
 >>> session_set_guide {"guide_level": 2, "trace_mode": "all"}
-guide_level=2 trace_mode=All (runner pid 13 generation 1 unchanged; handles kept)
+guide_level=2 trace_mode=All (runner pid 13 generation 1 unchanged; fds kept)
 
 >>> syscall_invoke {"name": "read", "args": {"fd": 3, "count": 64}}
 read(3, "Hello", 64) = 5
@@ -220,7 +220,7 @@ read は、fd が指すファイルから最大 count バイトを読み込む�
 ...
 
 >>> policy_set {"deny": ["mkdirat"], "errno": "EPERM"}
-Policy applied: deny=["mkdirat"] errno=EPERM. Runner recreated (generation 1 -> 2, pid 20); all handles were closed (state_reset: true).
+Policy applied: deny=["mkdirat"] errno=EPERM. Runner recreated (generation 1 -> 2, pid 20); all fds were closed (state_reset: true).
 seccomp: mode=2 filters=2 (Docker's default profile counts as one filter)
 
 >>> syscall_invoke {"name": "mkdirat", "args": {"path": "test", "mode": "0755"}}
@@ -239,7 +239,7 @@ mkdirat(AT_FDCWD, "test", 0755) = -1 EPERM (Operation not permitted)
 #5 observed  req-2 write(3</workspace/hello.txt>, "Hello", 5) = 5 <0.000051>
 ```
 
-`requested` は AI の要求（学習用ハンドル 3）、`observed` は strace が独立に見たカーネルへの実際の呼び出し（実 fd とそのパス）です。
+`requested` は AI の要求（fd 3）、`observed` は strace が独立に見たカーネルへの実際の呼び出し（実 fd とそのパス）です。
 SacredArts はパスやフラグを書き換えないので、両者は同じ syscall の 2 つの見え方になります。全文は [examples/demo-output.txt](examples/demo-output.txt)。
 
 ## AI に渡すサンプルプロンプト
@@ -257,7 +257,7 @@ SacredArts はパスやフラグを書き換えないので、両者は同じ sy
 ```sh
 make lint                                 # rustfmt --check と clippy（警告はエラー扱い）
 cargo test --workspace                    # macOS: 型・検証・パーサ・ガイド・イベントストアの単体テスト
-scripts/linux-test.sh                     # Docker 内の Linux で Runner（seccomp・パス・ハンドル含む）等のテスト
+scripts/linux-test.sh                     # Docker 内の Linux で Runner（seccomp・パス・fd・フラグ含む）等のテスト
 docker build -t sacredarts-sandbox:0.1.0 .
 cargo test -p sacredarts-mcp --test acceptance -- --ignored --test-threads=1   # 受け入れテスト（Docker 必須）
 ```
@@ -283,7 +283,7 @@ GitHub Actions（[.github/workflows/ci.yml](.github/workflows/ci.yml)）では�
 
 既知の制限:
 
-- amd64（x86_64）はコンパイル確認のみで、実機（amd64 Linux / Intel Mac）での実行は未検証です
+- amd64（x86_64）は Linux ホストで CI（GitHub Actions）の全テストが通っています。Intel Mac での実行は未検証です
 - 観測は strace によるもので、カーネル内部の動作は観測しません
 
 ## ロードマップ

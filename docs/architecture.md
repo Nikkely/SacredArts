@@ -22,7 +22,7 @@ Docker Desktop Linux VM ── Sandbox Container (Ubuntu 24.04, uid 10001)
             └─ sacredarts-runner    (crates/sacredarts-runner)
                  fd 0: AF_UNIX socketpair（Supervisor 側の相手）
                  cwd: /workspace（パスは書き換えずにカーネルへ）
-                 学習用ハンドル表、seccomp フィルタ
+                 fd のラベル表、seccomp フィルタ
 ```
 
 ## クレート構成
@@ -31,7 +31,7 @@ Docker Desktop Linux VM ── Sandbox Container (Ubuntu 24.04, uid 10001)
 |---|---|---|
 | `sacredarts-core` | 共有型: syscall 要求と入力検証、IPC メッセージ、ポリシー型、GuideLevel/TraceMode、上限値、strace 風フォーマット | どこでも |
 | `sacredarts-policy` | ポリシー → seccomp-BPF のコンパイルと適用（seccompiler、`libc::SYS_*` でアーキテクチャ別の番号） | Linux |
-| `sacredarts-runner` | 常駐 Runner（syscall 実行、ハンドル表、安全なパス解決、マーカー） | Linux |
+| `sacredarts-runner` | 常駐 Runner（syscall 実行、fd のラベル表、errno 名の解決、マーカー） | Linux |
 | `sacredarts-tracer` | strace 出力パーサ（どこでも）と Supervisor バイナリ（Linux） | 両方 |
 | `sacredarts-guide` | ガイドデータの読み込みと Level 1〜3 のレンダリング | どこでも |
 | `sacredarts-mcp` | MCP サーバー本体 | ホスト |
@@ -76,8 +76,9 @@ requested と observed は `request_id` で関連付けます。パスやフラ�
 ## 状態管理
 
 - **1 セッション = 1 コンテナ = 1 Supervisor**。Runner はセッション内で常駐し、ツール呼び出しごとに再起動しません。
-- **学習用ハンドル**: `openat` 成功時に 3 以上の空き最小番号を割り当て、実 fd と対応付けます（上限 64）。ハンドル 0〜2 や未使用番号はカーネルに渡す前に `bad_handle` で拒否します（Runner の IPC ソケットなど内部 fd を守るため）。
-- **Runner の再作成**: `policy_set`、syscall タイムアウト、Runner の異常終了で再作成します（`generation` が増え、ハンドルは失われます＝`state_reset: true`）。`session_set_guide` では再作成しません。
+- **fd**: AI が指定した fd 番号はそのままカーネルに渡します。Runner は起動時に IPC ソケットを fd 0 から `RLIMIT_NOFILE - 1`（通常 255）へ移し、fd 0 を `/dev/null` にします。拒否するのはこの IPC ソケットだけ（`reserved_fd`）です。開いた fd のパスとフラグは表示用に記録します。
+- **errno 名**: 数値から名前、名前から数値への変換は glibc の `strerrorname_np` で行います（手書きの表は持ちません）。
+- **Runner の再作成**: `policy_set`、syscall タイムアウト、Runner の異常終了で再作成します（`generation` が増え、開いていた fd は失われます＝`state_reset: true`）。ポリシーは再作成の前に supervisor で seccomp フィルタへコンパイルして検証し、失敗したら今の Runner を残します。`session_set_guide` では再作成しません。
 - **ポリシー変更の原子性**: 新しい Runner を起動して ping が通ってから旧 Runner を終了し、ホスト側のポリシーもその応答を受けてから更新します。失敗時は旧 Runner と旧ポリシーのまま `policy_apply_failed`（`policy_unchanged: true`）を返します。
 - **並行性**: セッションごとに tokio の Mutex で直列化します。別セッションは並行に動きます。`sandbox_destroy` はこの Mutex を待たずにセッションを登録から外し `docker rm -f` するので、ハングした要求があっても破棄できます。
 
@@ -98,10 +99,10 @@ requested と observed は `request_id` で関連付けます。パスやフラ�
 
 ## アーキテクチャ依存の扱い
 
-- syscall 番号、`O_*` フラグ値、errno 名はすべて `libc` クレートのターゲット別定数から得ます（例: `O_DIRECTORY` は x86_64 と aarch64 で値が異なる）。
+- syscall 番号と `O_*` フラグ値は `libc` クレートのターゲット別定数から、errno 名は glibc の `strerrorname_np` から得ます（例: `O_DIRECTORY` は x86_64 と aarch64 で値が異なる）。
 - requested syscall は libc のラッパーを介さず `syscall(SYS_<name>, ...)` で発行するため、カーネルが受け取る番号が確定します（glibc の `mkdir()` は x86_64 では `mkdir` を使いますが、SacredArts は常に `mkdirat`）。
 - seccompiler の `TargetArch` はビルドターゲットから選びます（aarch64 / x86_64）。フィルタにはアーキテクチャ検査が含まれ、異なる ABI の syscall はプロセスを kill します。
-- 動作確認済み: aarch64（Docker Desktop on Apple Silicon）。x86_64 は `cargo check --target x86_64-unknown-linux-gnu` のみ確認。
+- 動作確認済み: aarch64（Docker Desktop on Apple Silicon）、x86_64（GitHub Actions の Ubuntu で受け入れテストまで）。
 
 ## 検証済みの環境事実（Docker Desktop 29.0.1 / linuxkit 6.12.54 / arm64）
 

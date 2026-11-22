@@ -626,6 +626,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "sacredarts-core",
+ "sacredarts-policy",
  "serde_json",
 ]
 

@@ -31,12 +31,24 @@ mod linux {
         }) as i64
     }
 
-    pub fn errno_value(e: DenyErrno) -> u32 {
-        (match e {
-            DenyErrno::EPERM => libc::EPERM,
-            DenyErrno::EACCES => libc::EACCES,
-            DenyErrno::ENOSYS => libc::ENOSYS,
-        }) as u32
+    /// errno number for a name, resolved by the C library of the target
+    /// (glibc's `strerrorname_np`), so every errno it knows can be used.
+    pub fn errno_value(e: &DenyErrno) -> Result<u32, String> {
+        #[cfg(target_env = "gnu")]
+        {
+            unsafe extern "C" {
+                fn strerrorname_np(errnum: libc::c_int) -> *const libc::c_char;
+            }
+            // errno values are small positive ints; 4095 is the kernel's MAX_ERRNO.
+            for n in 1..4096 {
+                // SAFETY: returns NULL or a pointer to a static NUL-terminated string.
+                let p = unsafe { strerrorname_np(n) };
+                if !p.is_null() && unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes() == e.as_str().as_bytes() {
+                    return Ok(n as u32);
+                }
+            }
+        }
+        Err(format!("unknown errno name {:?}", e.as_str()))
     }
 
     fn target_arch() -> Result<TargetArch, String> {
@@ -63,7 +75,7 @@ mod linux {
         let filter = SeccompFilter::new(
             rules,
             SeccompAction::Allow,
-            SeccompAction::Errno(errno_value(policy.errno)),
+            SeccompAction::Errno(errno_value(&policy.errno)?),
             target_arch()?,
         )
         .map_err(|e| format!("building seccomp filter: {e}"))?;
@@ -96,11 +108,25 @@ mod linux {
             for n in SyscallName::ALL {
                 let p = Policy {
                     deny: vec![n],
-                    errno: DenyErrno::EPERM,
+                    errno: DenyErrno::default(),
                 };
                 let prog = compile(&p).unwrap().unwrap();
                 assert!(!prog.is_empty());
             }
+        }
+
+        #[test]
+        fn any_errno_name_resolves() {
+            let v = |s: &str| errno_value(&DenyErrno::parse(s).unwrap());
+            assert_eq!(v("EPERM").unwrap(), libc::EPERM as u32);
+            assert_eq!(v("EIO").unwrap(), libc::EIO as u32);
+            assert_eq!(v("EHWPOISON").unwrap(), libc::EHWPOISON as u32);
+            assert!(v("ENOTANERRNO").is_err());
+            let bad = Policy {
+                deny: vec![SyscallName::Getpid],
+                errno: DenyErrno::parse("ENOTANERRNO").unwrap(),
+            };
+            assert!(compile(&bad).is_err());
         }
 
         #[test]

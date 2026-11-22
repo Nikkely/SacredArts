@@ -34,16 +34,22 @@ pub fn quote_str(s: &str) -> String {
 pub fn format_dirfd(d: Dirfd) -> String {
     match d {
         Dirfd::AtFdcwd => "AT_FDCWD".to_string(),
-        Dirfd::Handle(h) => h.to_string(),
+        Dirfd::Fd(n) => n.to_string(),
     }
 }
 
-pub fn format_flags(flags: &[OpenFlag]) -> String {
-    flags.iter().map(|f| f.as_str()).collect::<Vec<_>>().join("|")
+/// Named flags followed by any numeric bits (`O_RDWR|0x200000`).
+pub fn format_flags(flags: &[OpenFlag], raw: u32) -> String {
+    let mut parts: Vec<String> = flags.iter().map(|f| f.as_str().to_string()).collect();
+    if raw != 0 || parts.is_empty() {
+        parts.push(format!("{raw:#x}"));
+    }
+    parts.join("|")
 }
 
+/// Octal with a leading 0, like strace (`0644`, `04755`, `0000`).
 pub fn format_mode(mode: u32) -> String {
-    format!("{mode:04o}")
+    format!("0{mode:03o}")
 }
 
 /// Format the call part, e.g. `openat(AT_FDCWD, "a", O_RDONLY)`.
@@ -55,13 +61,14 @@ pub fn format_call(req: &SyscallRequest, read_data: Option<&[u8]>) -> String {
             dirfd,
             path,
             flags,
+            raw_flags,
             mode,
         } => {
             let mut s = format!(
                 "openat({}, {}, {}",
                 format_dirfd(*dirfd),
                 quote_str(path),
-                format_flags(flags)
+                format_flags(flags, *raw_flags)
             );
             if let Some(m) = mode {
                 s.push_str(&format!(", {}", format_mode(*m)));
@@ -107,6 +114,7 @@ mod tests {
             dirfd: Dirfd::AtFdcwd,
             path: "hello.txt".into(),
             flags: vec![OpenFlag::O_WRONLY, OpenFlag::O_CREAT],
+            raw_flags: 0,
             mode: Some(0o644),
         };
         assert_eq!(
@@ -125,6 +133,10 @@ mod tests {
             format_result(-1, Some(("EPERM", "Operation not permitted"))),
             " = -1 EPERM (Operation not permitted)"
         );
+        assert_eq!(format_flags(&[OpenFlag::O_RDWR], 0x20_0000), "O_RDWR|0x200000");
+        assert_eq!(format_flags(&[], 66), "0x42");
+        assert_eq!(format_mode(0o4755), "04755");
+        assert_eq!(format_mode(0), "0000");
         assert_eq!(quote_bytes(&[b'a'; 40], 32), format!("\"{}\"...", "a".repeat(32)));
     }
 }

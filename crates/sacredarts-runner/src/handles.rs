@@ -1,21 +1,16 @@
-//! Learning handle table.
+//! Bookkeeping of the file descriptors this session opened.
 //!
-//! The AI never sees or names real file descriptors directly. It gets
-//! *learning handles* that the runner maps to real fds. This keeps the
-//! runner's own descriptors (IPC socket, stdio, the /workspace dirfd) out of
-//! reach: a request for handle 0 or for a handle that was never opened is
-//! rejected without touching the kernel.
-//!
-//! Handles are allocated like POSIX fds: the lowest free number starting at 3.
+//! This is *only* a label table (fd -> path and flags for display and
+//! `sandbox_inspect`). It never decides anything: every fd number the AI
+//! passes goes to the kernel, which returns EBADF for fds that are not open
+//! and EMFILE when RLIMIT_NOFILE is reached.
 
-use sacredarts_core::OpenFlag;
 use sacredarts_core::ipc::HandleInfo;
-use sacredarts_core::limits::{FIRST_HANDLE, MAX_HANDLES};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Default)]
 pub struct HandleTable {
-    entries: BTreeMap<u32, HandleInfo>,
+    entries: BTreeMap<i32, HandleInfo>,
 }
 
 impl HandleTable {
@@ -23,35 +18,24 @@ impl HandleTable {
         Self::default()
     }
 
-    pub fn is_full(&self) -> bool {
-        self.entries.len() >= MAX_HANDLES
-    }
-
-    /// Register a real fd and return its handle. `None` if the table is full.
-    pub fn insert(&mut self, real_fd: i32, path: String, flags: Vec<OpenFlag>) -> Option<HandleInfo> {
-        if self.is_full() {
-            return None;
-        }
-        let mut h = FIRST_HANDLE;
-        while self.entries.contains_key(&h) {
-            h += 1;
-        }
+    /// Record an fd the kernel just returned (replacing any stale label).
+    pub fn insert(&mut self, fd: i32, path: String, flags: String) -> HandleInfo {
         let info = HandleInfo {
-            handle: h,
-            real_fd,
+            handle: fd,
+            real_fd: fd,
             path,
             flags,
         };
-        self.entries.insert(h, info.clone());
-        Some(info)
+        self.entries.insert(fd, info.clone());
+        info
     }
 
-    pub fn get(&self, handle: u32) -> Option<&HandleInfo> {
-        self.entries.get(&handle)
+    pub fn get(&self, fd: i32) -> Option<&HandleInfo> {
+        self.entries.get(&fd)
     }
 
-    pub fn remove(&mut self, handle: u32) -> Option<HandleInfo> {
-        self.entries.remove(&handle)
+    pub fn remove(&mut self, fd: i32) -> Option<HandleInfo> {
+        self.entries.remove(&fd)
     }
 
     pub fn list(&self) -> Vec<HandleInfo> {
@@ -72,25 +56,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lowest_free_handle_is_reused() {
+    fn labels_follow_kernel_fds() {
         let mut t = HandleTable::new();
-        let a = t.insert(10, "a".into(), vec![]).unwrap();
-        let b = t.insert(11, "b".into(), vec![]).unwrap();
-        assert_eq!((a.handle, b.handle), (3, 4));
-        t.remove(3).unwrap();
+        assert_eq!(t.insert(3, "a".into(), "O_RDONLY".into()).handle, 3);
+        assert_eq!(t.insert(4, "b".into(), "O_RDONLY".into()).real_fd, 4);
+        assert_eq!(t.remove(3).unwrap().path, "a");
         assert!(t.get(3).is_none());
-        assert_eq!(t.insert(12, "c".into(), vec![]).unwrap().handle, 3);
-        assert_eq!(t.insert(13, "d".into(), vec![]).unwrap().handle, 5);
+        // the kernel reuses the lowest free fd; the label is simply replaced
+        t.insert(4, "c".into(), "O_RDWR".into());
+        assert_eq!(t.get(4).unwrap().path, "c");
+        assert_eq!(t.len(), 1);
         assert!(t.remove(99).is_none());
-    }
-
-    #[test]
-    fn table_is_bounded() {
-        let mut t = HandleTable::new();
-        for i in 0..MAX_HANDLES {
-            assert!(t.insert(i as i32 + 100, String::new(), vec![]).is_some());
-        }
-        assert!(t.is_full());
-        assert!(t.insert(1, String::new(), vec![]).is_none());
     }
 }

@@ -24,10 +24,10 @@ arguments:
     description: 開くファイルのパス。
   - name: flags
     type: int
-    description: アクセスモード（O_RDONLY / O_WRONLY / O_RDWR のどれか 1 つ）と、動作を変えるフラグの論理和。
+    description: アクセスモード（O_RDONLY=0 / O_WRONLY=1 / O_RDWR=2 のどれか。Linux では 3 も受け付け、権限だけ検査して read/write はできない fd になる）と、動作を変えるフラグの論理和。知らないビットは無視される。
   - name: mode
     type: mode_t
-    description: O_CREAT でファイルを新規作成するときのパーミッション。実際の値は mode & ~umask になる。
+    description: O_CREAT / O_TMPFILE でファイルを作るときのパーミッション。実際の値は mode & ~umask になる（setuid などの上位ビットも含めて渡せる）。C で省略すると不定値が渡るが、SacredArts では 0 を渡す。
 return_value: |
   成功すると新しいファイルディスクリプタ（その時点で未使用の最小の番号）。失敗すると -1 を返し、errno が設定されます。
 errors:
@@ -44,7 +44,13 @@ errors:
   - name: EACCES
     description: 権限がない（ディレクトリの検索権限、ファイルの読み書き権限など）。
   - name: EMFILE
-    description: プロセスが開ける fd の上限に達した。
+    description: プロセスが開ける fd の上限（RLIMIT_NOFILE。SacredArts のコンテナでは 256）に達した。
+  - name: ENAMETOOLONG
+    description: パス全体が PATH_MAX（4096 バイト）を超えた、またはパスの 1 要素が NAME_MAX（多くのファイルシステムで 255 バイト）を超えた。
+  - name: EINVAL
+    description: フラグの組み合わせが不正（例 O_TMPFILE に書き込み可能なアクセスモードがない、O_DIRECT をファイルシステムが扱えない）。
+  - name: EOPNOTSUPP
+    description: ファイルシステムが O_TMPFILE に対応していない。
   - name: EBADF
     description: dirfd が有効な fd ではない。
   - name: EROFS
@@ -72,6 +78,30 @@ flags:
     description: 最後の要素がシンボリックリンクなら追跡せず ELOOP で失敗させる。
   - name: O_CLOEXEC
     description: exec 時に自動で閉じる（close-on-exec）フラグを fd に付ける。
+  - name: O_NOCTTY
+    description: 端末を開いても、それをプロセスの制御端末にしない。
+  - name: O_NONBLOCK
+    description: 非ブロッキングモードで開く。FIFO などで待つ代わりにすぐ戻る（データがなければ EAGAIN）。
+  - name: O_NDELAY
+    description: O_NONBLOCK の別名（同じ値）。
+  - name: O_DSYNC
+    description: write のたびに、データ（と読み出しに必要なメタデータ）が記憶装置に書かれるまで待つ。
+  - name: O_SYNC
+    description: write のたびに、データとすべてのメタデータが記憶装置に書かれるまで待つ（O_DSYNC のビットを含む）。
+  - name: O_RSYNC
+    description: Linux では O_SYNC と同じ値。
+  - name: O_ASYNC
+    description: 入出力が可能になったときにシグナルで通知する（openat では実質的に無視され、fcntl で設定する）。
+  - name: O_DIRECT
+    description: ページキャッシュを通さずに直接入出力する。バッファの整列が必要で、tmpfs などでは EINVAL になる。
+  - name: O_LARGEFILE
+    description: 2 GiB を超えるファイルを扱えるようにする。64 ビット環境ではカーネルが常に付ける。
+  - name: O_NOATIME
+    description: read してもアクセス時刻を更新しない。ファイルの所有者でないと EPERM。
+  - name: O_PATH
+    description: ファイルを開かずに、場所だけを指す fd を得る。read/write はできない（EBADF）が、*at 系の dirfd などに使える。
+  - name: O_TMPFILE
+    description: 指定したディレクトリに名前のない一時ファイルを作る（O_DIRECTORY のビットを含む）。書き込み可能なアクセスモードと mode が必要。
 concepts:
   - name: Virtual File System（VFS）
     description: ファイルシステムの種類（ext4、tmpfs など）の違いを吸収する、カーネル内の共通層です。openat はまず VFS に届きます。
@@ -101,7 +131,7 @@ man_pages:
 explain:
   success: |
     今回は `{path}` を{flags_ja}状態にしています。
-    戻り値の `{ret}` はファイルディスクリプタです（SacredArts の学習用ハンドル。カーネル上の実際の fd は {real_fd}）。
+    戻り値の `{ret}` はファイルディスクリプタです（カーネルが返した値そのもの）。
     以降の read・write・close ではこの `{ret}` を指定します。
   failure: |
     `{path}` を開けませんでした。エラーは `{errno}`（{errno_message}）です。

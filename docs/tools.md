@@ -12,7 +12,7 @@
 
 | `error.kind` | 意味 | 主な `code` |
 |---|---|---|
-| `invalid_argument` | 入力検証で拒否（syscall 未発行） | `invalid_path` `invalid_flags` `invalid_mode` `missing_argument` `unknown_argument` `bad_handle` `invalid_guide_level` |
+| `invalid_argument` | 入力検証で拒否（syscall 未発行） | `invalid_path` `invalid_flags` `invalid_mode` `missing_argument` `unknown_argument` `reserved_fd` `invalid_errno` `invalid_guide_level` |
 | `unsupported_syscall` | 未対応の syscall 名 | `unsupported_syscall` `unknown_syscall` |
 | `session_not_found` | セッションが存在しない | `session_not_found` |
 | `limit_exceeded` | 上限超過 | `too_many_sessions` `limit_exceeded` |
@@ -71,11 +71,15 @@ syscall ごとの `args`:
 | name | args |
 |---|---|
 | `getpid` | `{}` |
-| `openat` | `dirfd?`: `"AT_FDCWD"`（既定）/ `-100` / ハンドル番号, `path`: 文字列（絶対・相対どちらも可。書き換えずにカーネルへ渡す）, `flags?`: 配列または `"O_A\|O_B"`（既定 `O_RDONLY`）, `mode?`: `"0644"`（8 進文字列）または整数。`O_CREAT` 時は必須。0000〜0777 |
-| `read` | `fd`: ハンドル, `count`: 0〜65536 |
-| `write` | `fd`: ハンドル, `data`: 文字列, `encoding?`: `"utf8"`（既定）/ `"base64"`, `count?`: 書き込むバイト数（既定は全量、`data` 長以下） |
-| `close` | `fd`: ハンドル |
-| `mkdirat` | `dirfd?`, `path`, `mode?`（既定 `"0755"`） |
+| `openat` | `dirfd?`: `"AT_FDCWD"`（既定）/ `-100` / 任意の fd 番号, `path`: 文字列（絶対・相対どちらも可。書き換えずにカーネルへ渡す）, `flags?`: 配列・`"O_A\|O_B\|0x80000"`・整数のいずれか（既定 `O_RDONLY`）, `mode?`: `"0644"`（8 進文字列）または整数（省略時は 0） |
+| `read` | `fd`: 任意の整数, `count`: 0〜65536 |
+| `write` | `fd`: 任意の整数, `data`: 文字列, `encoding?`: `"utf8"`（既定）/ `"base64"`, `count?`: 書き込むバイト数（既定は全量、`data` 長以下） |
+| `close` | `fd`: 任意の整数 |
+| `mkdirat` | `dirfd?`, `path`, `mode?`（既定 `"0755"`。setuid などのビットもそのまま渡す） |
+
+`flags` に使える名前は Linux の全 `O_*` フラグです: `O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_NOCTTY O_TRUNC O_APPEND O_NONBLOCK O_NDELAY O_DSYNC O_SYNC O_RSYNC O_ASYNC O_DIRECT O_LARGEFILE O_DIRECTORY O_NOFOLLOW O_NOATIME O_CLOEXEC O_PATH O_TMPFILE`。
+名前のないビットは数値（`0x40000000`、C と同じく `0` 始まりは 8 進）で混ぜられます。値はアーキテクチャごとに違うため、名前から値への変換はサンドボックス内（Runner）で行い、`kernel.runner_issued` には strace と同じ形でデコードした結果が出ます。
+アクセスモードの矛盾（`O_WRONLY` と `O_RDWR` の同時指定 = 3）や mode の省略も、そのままカーネルに渡します。
 
 未知のキーは `unknown_argument` で拒否します。
 
@@ -93,8 +97,7 @@ syscall ごとの `args`:
   "formatted": "openat(AT_FDCWD, \"/workspace/hello.txt\", O_WRONLY|O_CREAT, 0644) = 3",
   "denied_by_policy": false,
   "handle": {
-    "change": "opened", "handle": 3, "real_fd": 3, "path": "/workspace/hello.txt",
-    "note": "SacredArts returns learning handles, not raw kernel fds; real_fd is the descriptor inside the runner process"
+    "change": "opened", "handle": 3, "real_fd": 3, "path": "/workspace/hello.txt"
   },
   "guide": { "level": 2, "summary": "ファイルを開く（必要なら作成する）", "explanation": "...", "text": "..." },
   "trace_mode": "requested",
@@ -111,21 +114,21 @@ syscall ごとの `args`:
 }
 ```
 
-- `return_value` は AI 向けの値です。`openat` では **学習用ハンドル** になり、カーネルが返した実 fd は `kernel.return_value` / `handle.real_fd` です。
+- `return_value` はカーネルの戻り値そのものです。`openat` ではカーネルが返した fd です（`handle.handle` と `handle.real_fd` は同じ値）。
 - `read` では `data_text`（UTF-8 として正しいときのみ、そうでなければ `null`）、`data_base64`（常に）、`bytes_read` が付きます。
 - パスとフラグは要求のままカーネルに渡します（`/workspace` への閉じ込めや `O_NOFOLLOW` の付加はしません）。届く範囲はコンテナ内でカーネルが決めます（[security.md](security.md#2-パスsacredarts-は制限しない)）。
 - `requested_syscall_executed` は要求された syscall がカーネルに発行されたかどうかです（入力検証を通った要求では常に `true`）。
 - `denied_by_policy: true` は、セッションのポリシーがこの syscall を deny しており、返った errno がポリシーの errno と一致したことを示します。
 - `trace_mode: "all"` のときは `observation.syscalls` に strace の行が入り、テキストにも `# kernel (strace):` が付きます。
 
-### 学習用ハンドル（仮想 fd）について
+### fd について
 
-Level 1 の `openat(...) = 3` の `3` は **実 fd ではなく SacredArts の学習用ハンドル** です。
+Level 1 の `openat(...) = 3` の `3` は **カーネルが返した本物の fd** です。
 
-- 割り当て: 3 以上で空いている最小の番号（POSIX の「最小の未使用 fd」規則をまねています）。
-- 目的: Runner 自身の fd（IPC ソケット、stdio）を AI が誤って操作できないようにするため。多くの場合、ハンドル番号と実 fd は同じ値になります。
-- 対応の確認: 応答の `handle.real_fd`、`trace_get` の requested イベントの `details.handle_change` / `details.kernel_return_value`、observed イベント（strace の `-y` 表示 `3</workspace/hello.txt>`）、`sandbox_inspect` の `open_handles`。
-- 未使用のハンドルや閉じたハンドルへの操作は、カーネルに渡す前に `bad_handle` で拒否します（Linux なら `EBADF` に相当）。開いているハンドルに対する権限エラー（読み込み専用への `write` など）はカーネルが返す本物の `EBADF` です。
+- Runner の fd 0 は `/dev/null`、1 は `/dev/null`、2 は Runner の stderr（supervisor が診断用に読む）なので、普通のプロセスと同じく最初のファイルは 3 になります。
+- どの番号でもカーネルに渡します。開いていない fd には、カーネルが `EBADF` を返します。上限は `RLIMIT_NOFILE`（256）で、超えると `EMFILE` です。
+- 例外は Runner と supervisor をつなぐ IPC ソケット（通常 fd 255）だけで、`reserved_fd` で拒否します。閉じるとセッションが切れるためです。
+- `sandbox_inspect` の `open_handles` には、このセッションで開いた fd とそのパス・フラグが出ます（表示用の記録で、判定には使いません）。
 
 ## `syscall_describe`
 
@@ -180,8 +183,8 @@ Level 1: 概要とシグネチャ / Level 2: ＋説明・補足（`open` と `op
 入力: `{ "session_id": "uuid", "deny": ["mkdirat"], "errno": "EPERM" }`
 
 - `deny` は対応 6 syscall の部分集合のみ（それ以外は `unsupported_syscall`）。空配列で制限解除。
-- `errno`: `EPERM`（既定）/ `EACCES` / `ENOSYS`。
-- Runner を新しい seccomp フィルタ付きで再作成します。**開いていたハンドルは失われます**（`state_reset: true`）。
+- `errno`: Linux の errno 名なら何でも（既定 `EPERM`。`ENOSYS`、`EIO` など）。名前から番号への変換はサンドボックス内の glibc（`strerrorname_np`）で行い、知らない名前なら `policy_apply_failed` で失敗して元のポリシーが残ります。
+- Runner を新しい seccomp フィルタ付きで再作成します。**開いていた fd は失われます**（`state_reset: true`）。
 
 出力（抜粋）:
 
@@ -219,4 +222,4 @@ Supervisor に終了を依頼（応答がなくても続行）→ `docker rm -f`
 
 入力: `{ "session_id": "uuid", "guide_level": 3, "trace_mode": "all" }`（`trace_mode` は任意）
 
-Runner は再作成しません（`state_reset: false`、ハンドルは維持）。
+Runner は再作成しません（`state_reset: false`、開いている fd は維持）。
