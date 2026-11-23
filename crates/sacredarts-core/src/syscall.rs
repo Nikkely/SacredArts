@@ -31,6 +31,15 @@ pub enum SyscallName {
     Mkdirat,
     Getpriority,
     Setpriority,
+    Fork,
+    Kill,
+    Wait4,
+    #[serde(rename = "sched_setaffinity")]
+    #[strum(serialize = "sched_setaffinity")]
+    SchedSetaffinity,
+    #[serde(rename = "sched_getaffinity")]
+    #[strum(serialize = "sched_getaffinity")]
+    SchedGetaffinity,
 }
 
 impl SyscallName {
@@ -53,7 +62,7 @@ mod tests {
         }
         assert_eq!(
             SyscallName::VARIANTS.join(","),
-            "getpid,openat,read,write,close,mkdirat,getpriority,setpriority"
+            "getpid,openat,read,write,close,mkdirat,getpriority,setpriority,fork,kill,wait4,sched_setaffinity,sched_getaffinity"
         );
         assert!("open".parse::<SyscallName>().is_err());
         assert!("OPENAT".parse::<SyscallName>().is_err());

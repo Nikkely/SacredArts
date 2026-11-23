@@ -8,6 +8,7 @@ pub mod ipc;
 pub mod limits;
 pub mod modes;
 pub mod policy;
+pub mod process;
 pub mod request;
 pub mod syscall;
 

@@ -9,6 +9,7 @@ use base64::Engine;
 use sacredarts_core::ipc::{
     HandleChange, InvokeOutcome, RunnerHello, RunnerOp, RunnerReply, RunnerReplyBody, RunnerRequest,
 };
+use sacredarts_core::process::KernelOutput;
 use sacredarts_core::{Policy, SyscallRequest};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
@@ -577,4 +578,73 @@ fn seccomp_denies_setpriority_in_kernel() {
     assert_eq!(errno_of(&rn.call("setpriority", &json!({"prio": 5}))), "EPERM");
     assert_eq!(stat_field(rn.hello.pid, 19), 0, "nice unchanged");
     assert_eq!(ok(&rn.call("getpriority", &json!({}))), 20);
+}
+
+fn stat_state(pid: i32) -> String {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    s[s.rfind(')').unwrap() + 2..].split(' ').next().unwrap().to_string()
+}
+
+fn wait_output(o: &InvokeOutcome) -> (i32, i64) {
+    match o {
+        InvokeOutcome::Completed { output: Some(out), .. } => match out.as_ref() {
+            KernelOutput::Wait { status, utime_us, .. } => (*status, *utime_us),
+            KernelOutput::Cpus { .. } => panic!("not a wait output: {out:?}"),
+        },
+        other => panic!("no wait output: {other:?}"),
+    }
+}
+
+#[test]
+fn fork_kill_wait4_lifecycle() {
+    let mut rn = Rn::start("fork", &Policy::default());
+    // a child that exits at once stays a zombie until reaped
+    let z = i32::try_from(ok(&rn.call("fork", &json!({"child": "exit"})))).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(stat_state(z), "Z");
+    let w = rn.call("wait4", &json!({"pid": z}));
+    assert_eq!(ok(&w), i64::from(z));
+    assert_eq!(wait_output(&w).0, 0, "exited with 0");
+    assert!(!std::path::Path::new(&format!("/proc/{z}")).exists(), "reaped");
+
+    // a spinning child: WNOHANG returns 0, SIGSTOP stops it, SIGKILL ends it
+    let c = i32::try_from(ok(&rn.call("fork", &json!({"child": "spin", "seconds": 30})))).unwrap();
+    assert_eq!(ok(&rn.call("wait4", &json!({"pid": c, "options": ["WNOHANG"]}))), 0);
+    ok(&rn.call("kill", &json!({"pid": c, "sig": "SIGSTOP"})));
+    let s = rn.call("wait4", &json!({"pid": c, "options": "WUNTRACED"}));
+    assert_eq!(wait_output(&s).0, (19 << 8) | 0x7f, "stopped by SIGSTOP");
+    ok(&rn.call("kill", &json!({"pid": c, "sig": "SIGKILL"})));
+    let k = rn.call("wait4", &json!({"pid": c}));
+    assert_eq!(wait_output(&k).0, 9, "killed by SIGKILL");
+    assert_eq!(errno_of(&rn.call("wait4", &json!({}))), "ECHILD");
+    assert_eq!(errno_of(&rn.call("kill", &json!({"pid": c, "sig": 0}))), "ESRCH");
+    // the runner keeps working after its children came and went
+    assert_eq!(ok(&rn.call("getpid", &json!({}))), i64::from(rn.hello.pid));
+}
+
+#[test]
+fn nice_decides_the_share_of_a_shared_cpu() {
+    let mut rn = Rn::start("share", &Policy::default());
+    let get = rn.call("sched_getaffinity", &json!({}));
+    let cpu = match &get {
+        InvokeOutcome::Completed { output: Some(out), .. } => match out.as_ref() {
+            KernelOutput::Cpus { cpus } => cpus[0],
+            KernelOutput::Wait { .. } => panic!("{out:?}"),
+        },
+        other => panic!("{other:?}"),
+    };
+    let fast = ok(&rn.call("fork", &json!({"seconds": 2})));
+    let slow = ok(&rn.call("fork", &json!({"seconds": 2})));
+    for pid in [fast, slow] {
+        assert_eq!(
+            ok(&rn.call("sched_setaffinity", &json!({"pid": pid, "cpus": [cpu]}))),
+            0
+        );
+    }
+    assert_eq!(ok(&rn.call("setpriority", &json!({"who": slow, "prio": 19}))), 0);
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let f = wait_output(&rn.call("wait4", &json!({"pid": fast}))).1;
+    let s = wait_output(&rn.call("wait4", &json!({"pid": slow}))).1;
+    // weights 1024 : 15 -> about 68 : 1; allow a wide margin for noise
+    assert!(f > s * 10, "nice 0 got {f} us, nice 19 got {s} us");
 }

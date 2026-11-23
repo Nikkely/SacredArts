@@ -105,13 +105,14 @@ fn requested_event(request_id: &str, request: &SyscallRequest, args: Value, outc
             handle_change,
             read_data_b64,
             notes,
+            output,
             ..
         } => {
             let data = read_data_b64.as_deref().and_then(|b| {
                 use base64::Engine;
                 base64::engine::general_purpose::STANDARD.decode(b).ok()
             });
-            let line = format_call(request, data.as_deref())
+            let line = format_call(request, data.as_deref(), output.as_deref())
                 + &format_result(*ret, errno.as_ref().map(|e| (e.name.as_str(), e.message.as_str())));
             let details = json!({
                 "status": "completed",
@@ -124,7 +125,7 @@ fn requested_event(request_id: &str, request: &SyscallRequest, args: Value, outc
             (line, json!(ret), errno.as_ref().map(|e| e.name.clone()), details)
         }
         InvokeOutcome::Rejected { code, message } => (
-            format!("{} -> rejected ({code})", format_call(request, None)),
+            format!("{} -> rejected ({code})", format_call(request, None, None)),
             Value::Null,
             None,
             json!({ "status": "rejected", "code": code, "message": message }),
@@ -162,7 +163,10 @@ fn failed_request_event(request_id: &str, request: &SyscallRequest, args: Value,
         duration_ns: None,
         process: None,
         details: json!({ "status": "failed", "error": code }),
-        formatted: format!("{} -> {code}", sacredarts_core::format::format_call(request, None)),
+        formatted: format!(
+            "{} -> {code}",
+            sacredarts_core::format::format_call(request, None, None)
+        ),
     }
 }
 

@@ -1,0 +1,65 @@
+name: wait4
+executable: true
+category: process
+summary: 子プロセスの状態変化を待ち、終了状態と CPU 使用量を受け取る
+description: |
+  wait4 は、子プロセスが終了（または停止・再開）するのを待ち、その状態と、子が使ったリソース量（struct rusage）を受け取るシステムコールです。
+  終了した子を回収（ゾンビを片付ける）する役目もあります。
+purpose: |
+  親が子の結末を知るための仕組みです。rusage の ru_utime（ユーザー空間で使った CPU 時間）と ru_stime（カーネル内で使った CPU 時間）で、
+  子が実際にどれだけ CPU を使えたかを正確に測れます。
+signature: |
+  #include <sys/wait.h>
+
+  pid_t wait4(pid_t pid, int *wstatus, int options, struct rusage *rusage);
+arguments:
+  - name: pid
+    type: pid_t
+    description: 待つ相手。正の数ならその子、-1 ならどの子でもよい。
+  - name: wstatus
+    type: int *
+    description: （出力）終了状態。WIFEXITED / WIFSIGNALED などのマクロで読み解く。
+  - name: options
+    type: int
+    description: WNOHANG（待たずにすぐ戻る）、WUNTRACED（停止も報告）、WCONTINUED（再開も報告）。
+  - name: rusage
+    type: struct rusage *
+    description: （出力）子が使った CPU 時間などのリソース量。
+return_value: |
+  状態が変わった子の PID。WNOHANG を付けて、まだ変化した子がいなければ 0。失敗すると -1（errno を設定）。
+errors:
+  - name: ECHILD
+    description: 待てる子がいない（子がいない、または指定した PID が自分の子ではない）。
+  - name: EINTR
+    description: 待っている間にシグナルで中断された。
+  - name: EINVAL
+    description: options が不正。
+  - name: EPERM
+    description: SacredArts では seccomp ポリシーで wait4 を deny したときにカーネルが返します。
+flags:
+  - name: WNOHANG
+    description: 状態が変わった子がいなければ待たずに 0 を返す。SacredArts では、まだ動いている子を WNOHANG なしで待つと要求のタイムアウト（既定 5 秒）を超え、runner が作り直されます。
+  - name: WUNTRACED
+    description: SIGSTOP などで停止した子も報告する。
+  - name: WCONTINUED
+    description: SIGCONT で再開した子も報告する。
+concepts:
+  - name: ゾンビの回収
+    description: 終了した子は wait4 で回収されるまでプロセス表に残ります（PID も 1 つ使い続ける）。回収すると PID が解放されます。
+  - name: ユーザー時間とシステム時間
+    description: ru_utime はユーザー空間で計算していた時間、ru_stime はカーネルがその子のために働いた時間です。壁時計の経過時間とは違い、CPU を割り当てられていた時間だけが数えられます。
+state_changes:
+  - 終了した子が回収され、プロセス表から消える（停止・再開の報告だけなら消えない）。
+related:
+  - fork
+  - kill
+man_pages:
+  - wait4(2)
+  - waitpid(2)
+  - getrusage(2)
+explain:
+  success: |
+    戻り値 {ret} が状態の変わった子の PID です（0 なら WNOHANG で、まだ変化した子がいません）。{status_ja}
+    子が使った CPU 時間はユーザー {utime} 秒、システム {stime} 秒です。
+  failure: |
+    wait4（pid={pid}, options={options}）は失敗しました。エラーは `{errno}`（{errno_message}）です。

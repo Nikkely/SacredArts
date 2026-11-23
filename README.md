@@ -30,7 +30,7 @@ system calls themselves are the first-class objects you work with.
 
 | Capability | Description |
 |---|---|
-| Execution | Runs `getpid` `openat` `read` `write` `close` `mkdirat` `getpriority` `setpriority` on Linux inside Docker. State such as open fds persists within a session |
+| Execution | Runs `getpid` `openat` `read` `write` `close` `mkdirat` `getpriority` `setpriority` `fork` `kill` `wait4` `sched_setaffinity` `sched_getaffinity` on Linux inside Docker. State such as open fds persists within a session |
 | Observation | The runner is started as a child of `strace`, so the syscalls that actually reached the kernel are observed. What the AI requested (requested) and what was observed (observed) are recorded separately |
 | Control | Denies syscalls at the kernel level with seccomp-BPF (e.g. `mkdirat` → `EPERM`) |
 | Guidance | Explanation detail switches between levels 1–3. Explanations are generated from structured data based on the Linux man-pages (`guides/*.yaml`) plus the actual result |
@@ -189,6 +189,11 @@ Details: [docs/guide-mode.md](docs/guide-mode.md) (Japanese). Explanations are c
 | `mkdirat` | `dirfd?`, `path`, `mode?` (default `"0755"`; any bits) | |
 | `getpriority` | `which?` (`PRIO_PROCESS` (default) / `PRIO_PGRP` / `PRIO_USER` or an int), `who?` (default 0 = caller) | Returns the kernel's raw value `20 - nice` |
 | `setpriority` | `which?`, `who?`, `prio` | The kernel clamps out-of-range values to -20..19; lowering nice needs CAP_SYS_NICE |
+| `fork` | `child?` (`spin` (default; busy loop) / `sleep` / `exit`), `seconds?` (0–3600, default 60) | Issued as `clone(SIGCHLD)`. Returns the child's PID; the child never returns to the runner and `_exit`s after its program |
+| `kill` | `pid`, `sig?` (`"SIGTERM"` (default) / `"SIGKILL"` / `"SIGSTOP"` / `"SIGCONT"` / ... or an int) | |
+| `wait4` | `pid?` (default -1), `options?` (`WNOHANG` `WUNTRACED` `WCONTINUED`) | Returns the status and the child's CPU time (rusage). Waiting for a running child without `WNOHANG` hits the 5 s timeout and recreates the runner |
+| `sched_setaffinity` | `pid?` (default 0), `cpus` (e.g. `[0]`) | |
+| `sched_getaffinity` | `pid?` | Returns the CPU list; the return value is the number of mask bytes copied |
 | `open` | — (`syscall_describe` only) | For explaining `open` vs `openat` |
 
 The working directory is `/workspace`. Paths are not restricted and go to the kernel as written, so you can open `/etc/passwd` and the like (files inside the container).

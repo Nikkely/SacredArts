@@ -31,6 +31,12 @@ mod linux {
             SyscallName::Mkdirat => libc::SYS_mkdirat,
             SyscallName::Getpriority => libc::SYS_getpriority,
             SyscallName::Setpriority => libc::SYS_setpriority,
+            // glibc's fork() is clone(SIGCHLD); aarch64 has no fork syscall.
+            SyscallName::Fork => libc::SYS_clone,
+            SyscallName::Kill => libc::SYS_kill,
+            SyscallName::Wait4 => libc::SYS_wait4,
+            SyscallName::SchedSetaffinity => libc::SYS_sched_setaffinity,
+            SyscallName::SchedGetaffinity => libc::SYS_sched_getaffinity,
         }) as i64
     }
 

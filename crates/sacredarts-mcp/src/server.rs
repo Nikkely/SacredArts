@@ -34,7 +34,7 @@ impl From<TraceModeParam> for TraceMode {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PolicyParam {
-    /// Syscalls to deny with seccomp (subset of: getpid, openat, read, write, close, mkdirat, getpriority, setpriority).
+    /// Syscalls to deny with seccomp (subset of: getpid, openat, read, write, close, mkdirat, getpriority, setpriority, fork, kill, wait4, sched_setaffinity, sched_getaffinity).
     #[serde(default)]
     pub deny: Vec<String>,
     /// errno name returned for denied syscalls, e.g. EPERM (default), ENOSYS, EIO; any errno name Linux defines.
@@ -55,7 +55,7 @@ pub struct SandboxCreateParams {
 pub struct SyscallInvokeParams {
     /// Session returned by sandbox_create.
     pub session_id: String,
-    /// One of: getpid, openat, read, write, close, mkdirat, getpriority, setpriority.
+    /// One of: getpid, openat, read, write, close, mkdirat, getpriority, setpriority, fork, kill, wait4, sched_setaffinity, sched_getaffinity.
     pub name: String,
     /// Syscall arguments (see the tool description for each syscall).
     pub args: Option<Map<String, Value>>,
@@ -63,7 +63,7 @@ pub struct SyscallInvokeParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SyscallDescribeParams {
-    /// Syscall name: getpid, openat, read, write, close, mkdirat, getpriority, setpriority, or open (description only).
+    /// Syscall name: getpid, openat, read, write, close, mkdirat, getpriority, setpriority, fork, kill, wait4, sched_setaffinity, sched_getaffinity, or open (description only).
     pub name: String,
     /// 1-3 (default 1).
     pub guide_level: Option<u8>,
@@ -173,6 +173,12 @@ Arguments are passed to the kernel verbatim and the kernel decides (EBADF, EMFIL
 - getpriority: {"which"?: "PRIO_PROCESS"|"PRIO_PGRP"|"PRIO_USER" | <int> (default PRIO_PROCESS), "who"?: <int> (0 = caller, default)}
   Returns the raw kernel value 20 - nice (1..40), not the nice value itself.
 - setpriority: {"which"?: as above, "who"?: <int>, "prio": <int>}  (the kernel clamps prio to -20..19; lowering nice needs CAP_SYS_NICE, which the sandbox lacks)
+- fork: {"child"?: "spin" (default; busy loop, no syscalls) | "sleep" | "exit", "seconds"?: <0..3600, default 60>}  Issued as clone(SIGCHLD). Returns the child's PID; the child runs `child` and _exits (never returns to the runner). The container has --pids-limit 32 and --cpus 0.5.
+- kill: {"pid": <int>, "sig"?: "SIGTERM" (default) | "SIGKILL" | "SIGSTOP" | "SIGCONT" | ... | <int>}
+- wait4: {"pid"?: <int> (default -1 = any child), "options"?: ["WNOHANG","WUNTRACED","WCONTINUED"] | <int>}  -> status and the child's CPU time (rusage). Without WNOHANG it blocks; waiting longer than the request timeout (5 s) recreates the runner.
+- sched_setaffinity: {"pid"?: <int> (default 0 = self), "cpus": [<cpu>, ...]}
+- sched_getaffinity: {"pid"?: <int>}  -> the CPU list; returns the number of mask bytes the kernel copied.
+Measure CPU use of a running process by reading /proc/<pid>/stat (field 14 utime, 15 stime, in clock ticks of 1/100 s) with openat/read.
 Any fd number may be used except the runner's own socket to the supervisor (rejected as reserved_fd). RLIMIT_NOFILE is 256. cwd is /workspace; the container is non-root with a read-only root filesystem (/workspace and /tmp are writable). A failing syscall (errno) is a normal result with success=false; tool errors are only for arguments that cannot be marshalled or infrastructure problems."#;
 
 #[tool_router(router = tool_router)]
@@ -522,6 +528,7 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
             read_data_b64,
             notes,
             open_flags,
+            output,
         } => {
             let data = read_data_b64
                 .as_deref()
@@ -534,7 +541,7 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
             let denied_by_policy = *requested_executed
                 && policy.denies(name)
                 && errno.as_ref().is_some_and(|e| e.name == policy.errno.as_str());
-            let line = sacredarts_core::format::format_call(req, data.as_deref())
+            let line = sacredarts_core::format::format_call(req, data.as_deref(), output.as_deref())
                 + &sacredarts_core::format::format_result(
                     *ret,
                     errno.as_ref().map(|e| (e.name.as_str(), e.message.as_str())),
@@ -553,6 +560,7 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
                 trace_mode,
                 notes,
                 open_flags: open_flags.as_ref(),
+                output: output.as_deref(),
                 denied_by_policy,
             };
             let rendered = render_invocation(Guides::builtin(), guide_level, &view);
@@ -567,6 +575,7 @@ fn render_invoked(session_id: &str, req: &SyscallRequest, inv: Invoked) -> CallT
                 "errno": errno,
                 "formatted": line,
                 "denied_by_policy": denied_by_policy,
+                "output": output,
                 "guide": rendered,
                 "trace_mode": trace_mode,
                 "kernel": {
@@ -603,7 +612,7 @@ impl ServerHandler for SacredArts {
             .with_instructions(format!(
                 "SacredArts — AI-powered Linux System Call Laboratory. Invoke. Observe. Understand.\n\
                  {}\n\
-                 Typical flow: sandbox_create -> syscall_invoke (openat/write/read/close/mkdirat/getpid/getpriority/setpriority) -> trace_get / sandbox_inspect -> sandbox_destroy.\n\
+                 Typical flow: sandbox_create -> syscall_invoke (openat/write/read/close/mkdirat/getpid/getpriority/setpriority/fork/kill/wait4/sched_setaffinity/sched_getaffinity) -> trace_get / sandbox_inspect -> sandbox_destroy.\n\
                  Supported syscalls: {}. cwd is /workspace; any path may be used and the kernel decides (non-root, read-only root fs). Arguments (fds, flags, modes, paths) go to the kernel verbatim; openat returns the real fd.\n\
                  guide_level 1-3 controls explanation detail; trace_mode requested|all controls whether strace-observed kernel syscalls are shown.\n\
                  policy_set installs a kernel seccomp filter (runner is recreated, open fds are lost).",

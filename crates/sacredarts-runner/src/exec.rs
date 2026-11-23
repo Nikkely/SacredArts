@@ -17,6 +17,9 @@ use base64::Engine;
 use sacredarts_core::format::{DISPLAY_BYTES, format_mode, quote_bytes, quote_str};
 use sacredarts_core::ipc::{HandleChange, InvokeOutcome, IssuedCall, IssuedPurpose};
 use sacredarts_core::limits::MARKER_PREFIX;
+use sacredarts_core::process::{
+    CPU_SET_BYTES, ChildProgram, KernelOutput, format_cpus, format_timeval, format_wait_options, signal_name,
+};
 use sacredarts_core::{DecodedFlags, Dirfd, OpenFlag, PrioWhich, SyscallRequest, ValidationError};
 use std::ffi::CString;
 use std::os::fd::RawFd;
@@ -168,6 +171,11 @@ impl Runner {
             SyscallRequest::Mkdirat { dirfd, path, mode } => self.mkdirat(*dirfd, path, *mode),
             SyscallRequest::Getpriority { which, who } => Ok(Self::getpriority(*which, *who)),
             SyscallRequest::Setpriority { which, who, prio } => Ok(Self::setpriority(*which, *who, *prio)),
+            SyscallRequest::Fork { child, seconds } => Ok(self.fork(*child, *seconds)),
+            SyscallRequest::Kill { pid, sig } => Ok(Self::kill(*pid, *sig)),
+            SyscallRequest::Wait4 { pid, options } => Ok(Self::wait4(*pid, *options)),
+            SyscallRequest::SchedSetaffinity { pid, cpus } => Ok(Self::sched_setaffinity(*pid, cpus)),
+            SyscallRequest::SchedGetaffinity { pid } => Ok(Self::sched_getaffinity(*pid)),
         };
         r.unwrap_or_else(|v| InvokeOutcome::Rejected {
             code: v.code,
@@ -181,6 +189,7 @@ impl Runner {
         handle_change: Option<HandleChange>,
         read_data: Option<&[u8]>,
         open_flags: Option<DecodedFlags>,
+        output: Option<KernelOutput>,
     ) -> InvokeOutcome {
         InvokeOutcome::Completed {
             requested_executed: true,
@@ -191,6 +200,7 @@ impl Runner {
             read_data_b64: read_data.map(|d| base64::engine::general_purpose::STANDARD.encode(d)),
             notes: vec![],
             open_flags,
+            output: output.map(Box::new),
         }
     }
 
@@ -199,6 +209,7 @@ impl Runner {
         Self::completed(
             r,
             vec![call(syscall, IssuedPurpose::Requested, args, r)],
+            None,
             None,
             None,
             None,
@@ -272,7 +283,7 @@ impl Runner {
                 info: self.handles.insert(r.0 as RawFd, label, decoded.to_string()),
             }
         });
-        Ok(Self::completed(r, issued, opened, None, Some(decoded)))
+        Ok(Self::completed(r, issued, opened, None, Some(decoded), None))
     }
 
     fn read(&mut self, fd: i32, count: usize) -> Result<InvokeOutcome, Stop> {
@@ -290,7 +301,7 @@ impl Runner {
             format!("{shown_fd}, {shown}, {count}"),
             r,
         )];
-        Ok(Self::completed(r, issued, None, data, None))
+        Ok(Self::completed(r, issued, None, data, None, None))
     }
 
     fn write(&mut self, fd: i32, data: &[u8]) -> Result<InvokeOutcome, Stop> {
@@ -328,7 +339,7 @@ impl Runner {
             .then(|| self.handles.remove(fd))
             .flatten()
             .map(|info| HandleChange::Closed { info });
-        Ok(Self::completed(r, issued, closed, None, None))
+        Ok(Self::completed(r, issued, closed, None, None, None))
     }
 
     fn mkdirat(&mut self, dirfd: Dirfd, path: &str, mode: u32) -> Result<InvokeOutcome, Stop> {
@@ -362,6 +373,133 @@ impl Runner {
             r,
         )
     }
+
+    /// `fork()` as glibc does it: `clone(SIGCHLD)` with no new stack, so the
+    /// child is a copy of the runner (memory, fds, nice, CPU affinity,
+    /// seccomp filter). The child closes the IPC socket, runs `child` and
+    /// calls `_exit`; it never returns to the runner's loop.
+    fn fork(&mut self, child: ChildProgram, seconds: u32) -> InvokeOutcome {
+        let flags = libc::c_ulong::try_from(libc::SIGCHLD).unwrap_or_default();
+        // SAFETY: the runner is single-threaded, so the child is a complete
+        // copy; it only calls async-signal-safe functions and then `_exit`.
+        let r = result(unsafe { libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0) });
+        if r.1.is_none() && r.0 == 0 {
+            child_main(self.ipc_fd, child, seconds);
+        }
+        Self::plain("clone", "child_stack=NULL, flags=SIGCHLD".into(), r)
+    }
+
+    fn kill(pid: i32, sig: i32) -> InvokeOutcome {
+        // SAFETY: kill only takes integers; the kernel checks permissions.
+        let r = result(unsafe { libc::syscall(libc::SYS_kill, pid, sig) });
+        Self::plain("kill", format!("{pid}, {}", signal_name(sig)), r)
+    }
+
+    /// Reap a child. The kernel fills the status word and `struct rusage`
+    /// (the child's CPU time). Without `WNOHANG` this blocks until a child
+    /// changes state, which can exceed the request timeout.
+    fn wait4(pid: i32, options: i32) -> InvokeOutcome {
+        let mut status: libc::c_int = 0;
+        // SAFETY: rusage is plain data; all-zero is a valid value.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `status` and `ru` are valid writable locations for the call.
+        let r = result(unsafe { libc::syscall(libc::SYS_wait4, pid, &raw mut status, options, &raw mut ru) });
+        let us = |t: libc::timeval| i64::from(t.tv_sec) * 1_000_000 + i64::from(t.tv_usec);
+        // ret 0 (WNOHANG, nothing changed) leaves status and rusage untouched.
+        let output = (r.1.is_none() && r.0 > 0).then(|| KernelOutput::Wait {
+            status,
+            utime_us: us(ru.ru_utime),
+            stime_us: us(ru.ru_stime),
+        });
+        let args = match &output {
+            Some(KernelOutput::Wait { utime_us, stime_us, .. }) => format!(
+                "{pid}, {status:#x}, {}, {{ru_utime={}, ru_stime={}}}",
+                format_wait_options(options),
+                format_timeval(*utime_us),
+                format_timeval(*stime_us)
+            ),
+            _ => format!("{pid}, <status>, {}, <rusage>", format_wait_options(options)),
+        };
+        let issued = vec![call("wait4", IssuedPurpose::Requested, args, r)];
+        Self::completed(r, issued, None, None, None, output)
+    }
+
+    fn sched_setaffinity(pid: i32, cpus: &[u32]) -> InvokeOutcome {
+        let mut mask = [0u8; CPU_SET_BYTES];
+        for c in cpus {
+            let c = *c as usize;
+            if let Some(b) = mask.get_mut(c / 8) {
+                *b |= 1 << (c % 8);
+            }
+        }
+        // SAFETY: `mask` has CPU_SET_BYTES readable bytes.
+        let r = result(unsafe { libc::syscall(libc::SYS_sched_setaffinity, pid, CPU_SET_BYTES, mask.as_ptr()) });
+        Self::plain(
+            "sched_setaffinity",
+            format!("{pid}, {CPU_SET_BYTES}, {}", format_cpus(cpus)),
+            r,
+        )
+    }
+
+    /// The raw syscall returns the number of mask bytes the kernel copied.
+    fn sched_getaffinity(pid: i32) -> InvokeOutcome {
+        let mut mask = [0u8; CPU_SET_BYTES];
+        // SAFETY: `mask` has CPU_SET_BYTES writable bytes.
+        let r = result(unsafe { libc::syscall(libc::SYS_sched_getaffinity, pid, CPU_SET_BYTES, mask.as_mut_ptr()) });
+        let output = r.1.is_none().then(|| {
+            let n = usize::try_from(r.0).unwrap_or(0).min(CPU_SET_BYTES);
+            let cpus = (0..n * 8)
+                .filter(|i| mask[i / 8] & (1 << (i % 8)) != 0)
+                .filter_map(|i| u32::try_from(i).ok())
+                .collect();
+            KernelOutput::Cpus { cpus }
+        });
+        let shown = match &output {
+            Some(KernelOutput::Cpus { cpus }) => format_cpus(cpus),
+            _ => "<mask>".into(),
+        };
+        let issued = vec![call(
+            "sched_getaffinity",
+            IssuedPurpose::Requested,
+            format!("{pid}, {CPU_SET_BYTES}, {shown}"),
+            r,
+        )];
+        Self::completed(r, issued, None, None, None, output)
+    }
+}
+
+/// What a forked child runs. Never returns.
+fn child_main(ipc_fd: RawFd, child: ChildProgram, seconds: u32) -> ! {
+    // SAFETY: the child must not keep the supervisor's socket open (the
+    // supervisor detects a dead runner by EOF on it).
+    unsafe {
+        libc::close(ipc_fd);
+    }
+    match child {
+        ChildProgram::Exit => {}
+        ChildProgram::Sleep => {
+            let ts = libc::timespec {
+                tv_sec: libc::time_t::from(seconds),
+                tv_nsec: 0,
+            };
+            // SAFETY: `ts` is valid for the call; the remaining time is not needed.
+            unsafe {
+                libc::nanosleep(&raw const ts, std::ptr::null_mut());
+            }
+        }
+        ChildProgram::Spin => {
+            // Pure user-space work; the clock is read through the vDSO.
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(seconds.into());
+            let mut x = 0u64;
+            while std::time::Instant::now() < end {
+                for _ in 0..100_000 {
+                    x = std::hint::black_box(x.wrapping_add(1));
+                }
+            }
+        }
+    }
+    // SAFETY: _exit ends the child without running the runner's destructors.
+    unsafe { libc::_exit(0) }
 }
 
 /// One syscall the runner issued, as reported back to the host.

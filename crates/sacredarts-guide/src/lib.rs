@@ -7,6 +7,9 @@
 
 use sacredarts_core::format::{DISPLAY_BYTES, format_dirfd, format_flags, format_mode, quote_bytes, quote_str};
 use sacredarts_core::ipc::{ErrnoInfo, HandleInfo, IssuedCall, IssuedPurpose, Observation, ObservationStatus};
+use sacredarts_core::process::{
+    CPU_SET_BYTES, ChildProgram, KernelOutput, WaitStatus, format_cpus, format_wait_options, secs, signal_name,
+};
 use sacredarts_core::{DecodedFlags, GuideLevel, NICE_MAX, NICE_MIN, OpenFlag, PrioWhich, SyscallRequest, TraceMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -67,6 +70,17 @@ const BUILTIN: &[(&str, &str)] = &[
     ("mkdirat", include_str!("../../../guides/mkdirat.yaml")),
     ("getpriority", include_str!("../../../guides/getpriority.yaml")),
     ("setpriority", include_str!("../../../guides/setpriority.yaml")),
+    ("fork", include_str!("../../../guides/fork.yaml")),
+    ("kill", include_str!("../../../guides/kill.yaml")),
+    ("wait4", include_str!("../../../guides/wait4.yaml")),
+    (
+        "sched_setaffinity",
+        include_str!("../../../guides/sched_setaffinity.yaml"),
+    ),
+    (
+        "sched_getaffinity",
+        include_str!("../../../guides/sched_getaffinity.yaml"),
+    ),
 ];
 
 pub struct Guides {
@@ -137,6 +151,8 @@ pub struct InvocationView<'a> {
     pub notes: &'a [String],
     /// openat: flags as the kernel received them (decoded in the sandbox).
     pub open_flags: Option<&'a DecodedFlags>,
+    /// Output arguments the kernel filled in (wait4, sched_getaffinity).
+    pub output: Option<&'a KernelOutput>,
     /// The session policy denies this syscall (so an errno equal to the
     /// policy errno comes from the seccomp filter).
     pub denied_by_policy: bool,
@@ -182,6 +198,77 @@ fn access_ja(flags: &DecodedFlags) -> String {
         ""
     };
     format!("{open}{trunc}{append}{mode}")
+}
+
+/// Template values for the scheduling and process syscalls.
+fn process_vars(v: &InvocationView<'_>) -> Vec<(&'static str, String)> {
+    match v.request {
+        SyscallRequest::Getpriority { which, who } => vec![
+            ("which", PrioWhich::display(*which)),
+            ("who", who.to_string()),
+            // The raw syscall returns 20 - nice.
+            ("nice", (20 - v.ret).to_string()),
+        ],
+        SyscallRequest::Setpriority { which, who, prio } => {
+            let effective = (*prio).clamp(NICE_MIN, NICE_MAX);
+            let note = if effective == *prio {
+                String::new()
+            } else {
+                format!(
+                    "要求値 {prio} は範囲外なので、カーネルは黙って {effective} に丸めました（エラーにはなりません）。"
+                )
+            };
+            vec![
+                ("which", PrioWhich::display(*which)),
+                ("who", who.to_string()),
+                ("prio", prio.to_string()),
+                ("effective", effective.to_string()),
+                ("clamp_note", note),
+            ]
+        }
+        SyscallRequest::Fork { child, seconds } => {
+            let what = match child {
+                ChildProgram::Spin => {
+                    format!("{seconds} 秒間 CPU で計算し続け（システムコールを使わないループ）、その後終了します")
+                }
+                ChildProgram::Sleep => format!("{seconds} 秒間眠り（nanosleep）、その後終了します"),
+                ChildProgram::Exit => "すぐに終了します。親が wait4 で回収するまでゾンビとして残ります".to_string(),
+            };
+            vec![("child", <&str>::from(*child).to_string()), ("child_ja", what)]
+        }
+        SyscallRequest::Kill { pid, sig } => vec![("pid", pid.to_string()), ("sig", signal_name(*sig))],
+        SyscallRequest::Wait4 { pid, options } => {
+            let (status, utime, stime) = match v.output {
+                Some(KernelOutput::Wait {
+                    status,
+                    utime_us,
+                    stime_us,
+                }) => (WaitStatus::decode(*status).ja(), secs(*utime_us), secs(*stime_us)),
+                _ => (String::new(), String::new(), String::new()),
+            };
+            vec![
+                ("pid", pid.to_string()),
+                ("options", format_wait_options(*options)),
+                ("status_ja", status),
+                ("utime", utime),
+                ("stime", stime),
+            ]
+        }
+        SyscallRequest::SchedSetaffinity { pid, cpus } => vec![("pid", pid.to_string()), ("cpus", format_cpus(cpus))],
+        SyscallRequest::SchedGetaffinity { pid } => {
+            let cpus = match v.output {
+                Some(KernelOutput::Cpus { cpus }) => format_cpus(cpus),
+                _ => String::new(),
+            };
+            vec![("pid", pid.to_string()), ("cpus", cpus)]
+        }
+        SyscallRequest::Getpid
+        | SyscallRequest::Openat { .. }
+        | SyscallRequest::Read { .. }
+        | SyscallRequest::Write { .. }
+        | SyscallRequest::Close { .. }
+        | SyscallRequest::Mkdirat { .. } => vec![],
+    }
 }
 
 fn fill(template: &str, v: &InvocationView<'_>) -> String {
@@ -234,29 +321,7 @@ fn fill(template: &str, v: &InvocationView<'_>) -> String {
         }
         SyscallRequest::Close { fd } => vec![("fd", fd.to_string())],
         SyscallRequest::Getpid => vec![],
-        SyscallRequest::Getpriority { which, who } => vec![
-            ("which", PrioWhich::display(*which)),
-            ("who", who.to_string()),
-            // The raw syscall returns 20 - nice.
-            ("nice", (20 - v.ret).to_string()),
-        ],
-        SyscallRequest::Setpriority { which, who, prio } => {
-            let effective = (*prio).clamp(NICE_MIN, NICE_MAX);
-            let note = if effective == *prio {
-                String::new()
-            } else {
-                format!(
-                    "要求値 {prio} は範囲外なので、カーネルは黙って {effective} に丸めました（エラーにはなりません）。"
-                )
-            };
-            vec![
-                ("which", PrioWhich::display(*which)),
-                ("who", who.to_string()),
-                ("prio", prio.to_string()),
-                ("effective", effective.to_string()),
-                ("clamp_note", note),
-            ]
-        }
+        _ => process_vars(v),
     };
     common
         .into_iter()
@@ -334,7 +399,7 @@ fn explanation(g: &SyscallGuide, v: &InvocationView<'_>) -> String {
 
 fn arg_values(req: &SyscallRequest, v: &InvocationView<'_>) -> Vec<(String, String)> {
     match req {
-        SyscallRequest::Getpid => vec![],
+        SyscallRequest::Getpid | SyscallRequest::Fork { .. } => vec![],
         SyscallRequest::Openat {
             dirfd,
             path,
@@ -377,6 +442,23 @@ fn arg_values(req: &SyscallRequest, v: &InvocationView<'_>) -> Vec<(String, Stri
             ("which".into(), PrioWhich::display(*which)),
             ("who".into(), who.to_string()),
             ("prio".into(), prio.to_string()),
+        ],
+        SyscallRequest::Kill { pid, sig } => vec![("pid".into(), pid.to_string()), ("sig".into(), signal_name(*sig))],
+        SyscallRequest::Wait4 { pid, options } => vec![
+            ("pid".into(), pid.to_string()),
+            ("wstatus".into(), "（出力）終了状態".into()),
+            ("options".into(), format_wait_options(*options)),
+            ("rusage".into(), "（出力）子が使った CPU 時間など".into()),
+        ],
+        SyscallRequest::SchedSetaffinity { pid, cpus } => vec![
+            ("pid".into(), pid.to_string()),
+            ("cpusetsize".into(), CPU_SET_BYTES.to_string()),
+            ("mask".into(), format_cpus(cpus)),
+        ],
+        SyscallRequest::SchedGetaffinity { pid } => vec![
+            ("pid".into(), pid.to_string()),
+            ("cpusetsize".into(), CPU_SET_BYTES.to_string()),
+            ("mask".into(), "（出力）".into()),
         ],
     }
 }
@@ -686,7 +768,7 @@ mod tests {
     ) -> InvocationView<'a> {
         InvocationView {
             request: req,
-            requested_line: format_call(req, None) + &format_result(3, None),
+            requested_line: format_call(req, None, None) + &format_result(3, None),
             executed: true,
             ret: 3,
             kernel_ret: 3,
@@ -698,6 +780,7 @@ mod tests {
             trace_mode: mode,
             notes: &[],
             open_flags: None,
+            output: None,
             denied_by_policy: false,
         }
     }

@@ -1,0 +1,62 @@
+name: fork
+executable: true
+category: process
+summary: 自分のコピーとして子プロセスを作る
+description: |
+  fork は、呼び出したプロセスをほぼそのまま複製して子プロセスを作るシステムコールです。
+  親には子の PID が、子には 0 が返ります。1 回呼ぶと 2 つのプロセスで「戻ってくる」のが特徴です。
+purpose: |
+  新しいプロセスを作る基本の手段です。シェルがコマンドを実行するときも、fork で自分を複製してから
+  子が execve で別のプログラムに置き換わります。
+signature: |
+  #include <unistd.h>
+
+  pid_t fork(void);
+arguments: []
+return_value: |
+  親には子の PID、子には 0 が返ります。失敗すると親に -1 が返り（errno を設定）、子は作られません。
+errors:
+  - name: EAGAIN
+    description: |
+      プロセス数の上限に達した（RLIMIT_NPROC や cgroup の pids.max）。SacredArts のコンテナは --pids-limit 32 なので、
+      init・supervisor・strace・runner を含めて 32 個を超える fork はカーネルに断られます。
+  - name: ENOMEM
+    description: 子のためのメモリを確保できなかった。
+  - name: EPERM
+    description: SacredArts では seccomp ポリシーで fork（clone）を deny したときにカーネルが返します。
+flags: []
+concepts:
+  - name: 子が受け継ぐもの
+    description: |
+      メモリの内容（コピーオンライト）、開いている fd、nice 値、CPU アフィニティ、seccomp フィルタ、カレントディレクトリなど。
+      PID と親 PID、保留中のシグナル、リソース使用量（CPU 時間）は受け継ぎません。
+  - name: コピーオンライト（CoW）
+    description: fork 直後の親子はメモリのページを共有し、どちらかが書き込んだページだけが初めて複製されます。だから fork は速いのです。
+  - name: ゾンビと孤児
+    description: |
+      終了した子は、親が wait4 で回収するまで「ゾンビ」（/proc/<pid>/stat の状態が Z）として残ります。
+      親が先に死ぬと子は「孤児」になり、PID 1（init）に引き取られて回収されます。
+  - name: SacredArts の子プロセス
+    description: |
+      SacredArts では子は runner のコピーですが、runner には戻らず、child 引数で選んだ動作（spin = CPU を回し続ける、
+      sleep = 眠る、exit = すぐ終わる）をして _exit します。
+state_changes:
+  - プロセスが 1 つ増える（コンテナの pids カウンタも 1 増える）。
+related:
+  - kill
+  - wait4
+  - setpriority
+  - sched_setaffinity
+man_pages:
+  - fork(2)
+  - clone(2)
+  - wait4(2)
+explain:
+  success: |
+    子プロセス（PID {ret}）を作りました。子は {child_ja}。
+    親子どちらも同じ fork から戻りましたが、親には子の PID {ret}、子には 0 が返っています。
+  failure: |
+    子プロセスを作れませんでした。エラーは `{errno}`（{errno_message}）です。
+notes:
+  - |
+    aarch64 Linux には fork システムコールがありません。glibc の fork() は clone(SIGCHLD) を発行しており、SacredArts も同じく clone を直接発行します（strace にも clone と表示されます）。

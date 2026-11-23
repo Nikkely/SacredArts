@@ -1,0 +1,61 @@
+name: sched_setaffinity
+executable: true
+category: scheduling
+summary: プロセスを動かしてよい CPU を指定する
+description: |
+  sched_setaffinity は、プロセス（正確にはスレッド）が動いてよい CPU の集合（CPU アフィニティ）を設定するシステムコールです。
+  たとえば [0] にすると、そのプロセスは CPU 0 でしか動かなくなります。
+purpose: |
+  キャッシュを効かせる、特定の CPU を空けておく、などのために使います。
+  スケジューラは CPU ごとに実行待ちの列を持ち、nice による取り分の調整はその列の中で行われます。
+  同じ CPU に複数のプロセスを閉じ込めると、nice の差がそのまま取り分の差として現れます。
+signature: |
+  #define _GNU_SOURCE
+  #include <sched.h>
+
+  int sched_setaffinity(pid_t pid, size_t cpusetsize, const cpu_set_t *mask);
+arguments:
+  - name: pid
+    type: pid_t
+    description: 対象。0 なら呼び出し元自身。
+  - name: cpusetsize
+    type: size_t
+    description: mask のバイト数。SacredArts は glibc の cpu_set_t と同じ 128 バイト（1024 CPU 分）を渡す。
+  - name: mask
+    type: const cpu_set_t *
+    description: 動いてよい CPU のビット集合。
+return_value: |
+  成功すると 0。失敗すると -1（errno を設定）。
+errors:
+  - name: EINVAL
+    description: mask に、実在してかつ cgroup（cpuset）で許された CPU が 1 つも含まれていない。
+  - name: ESRCH
+    description: pid のプロセスがない。
+  - name: EPERM
+    description: |
+      他人のプロセスを変えようとしたが CAP_SYS_NICE がない。
+      SacredArts では seccomp ポリシーで sched_setaffinity を deny したときにもカーネルが返します。
+flags: []
+concepts:
+  - name: CPU ごとの実行キュー
+    description: |
+      Linux のスケジューラは CPU ごとに実行待ちの列を持ちます。nice の重みで取り分を分けるのは同じ列に並んだプロセス同士だけです。
+      別々の CPU で動いていれば、nice が違っても互いに影響しません。
+  - name: 一般ユーザーでも変えられる
+    description: nice を下げるのと違い、自分のプロセスのアフィニティは特権なしで自由に変えられます。
+  - name: fork で受け継がれる
+    description: 子プロセスは親のアフィニティを受け継ぎます。
+state_changes:
+  - 対象プロセスが動ける CPU が変わる（今いる CPU が外れたら、すぐ別の CPU へ移される）。
+related:
+  - sched_getaffinity
+  - setpriority
+man_pages:
+  - sched_setaffinity(2)
+  - sched(7)
+  - cpuset(7)
+explain:
+  success: |
+    PID {pid}（0 は自分）を CPU {cpus} でしか動かないようにしました。
+  failure: |
+    PID {pid} のアフィニティを {cpus} にできませんでした。エラーは `{errno}`（{errno_message}）です。

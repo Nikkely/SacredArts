@@ -57,6 +57,8 @@ state_changes:
   - 対象プロセス（またはグループ・ユーザーの全プロセス）の nice 値が変わる。子プロセスは fork 時にこの値を引き継ぐ。
 related:
   - getpriority
+  - fork
+  - sched_setaffinity
 man_pages:
   - setpriority(2)
   - sched(7)

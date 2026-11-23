@@ -1,0 +1,52 @@
+name: kill
+executable: true
+category: process
+summary: プロセスにシグナルを送る
+description: |
+  kill は、指定したプロセスにシグナル（カーネル経由の短い通知）を送るシステムコールです。
+  名前に反して「殺す」だけでなく、一時停止（SIGSTOP）・再開（SIGCONT）・存在確認（シグナル 0）にも使います。
+purpose: |
+  プロセスを外から制御する基本の手段です。SIGKILL と SIGSTOP は受け取る側が無視も横取りもできず、必ずカーネルが実行します。
+signature: |
+  #include <signal.h>
+
+  int kill(pid_t pid, int sig);
+arguments:
+  - name: pid
+    type: pid_t
+    description: 送り先。正の数ならその PID、0 なら自分のプロセスグループ全体、-1 なら送れる全プロセス（自分と PID 1 を除く）、-N ならプロセスグループ N。
+  - name: sig
+    type: int
+    description: 送るシグナル。0 を指定すると何も送らず、送れるか（存在して権限があるか）だけを確かめる。
+return_value: |
+  成功すると 0。失敗すると -1（errno を設定）。
+errors:
+  - name: ESRCH
+    description: 該当するプロセスがない（終了してゾンビになったプロセスにはまだ送れます）。
+  - name: EPERM
+    description: |
+      送る権限がない。一般ユーザーは、実 UID または実効 UID が相手の実 UID か saved set-user-ID と一致するプロセスにしか送れません。
+      SacredArts では seccomp ポリシーで kill を deny したときにもカーネルが返します。
+  - name: EINVAL
+    description: シグナル番号が不正。
+flags: []
+concepts:
+  - name: SIGKILL と SIGTERM
+    description: SIGTERM は「終わってください」というお願いで、受け取る側が後片付けや無視ができます。SIGKILL は即座に強制終了で、拒否できません。
+  - name: SIGSTOP と SIGCONT
+    description: SIGSTOP でプロセスは一時停止（状態 T）し、CPU を一切使わなくなります。SIGCONT で再開します。
+  - name: PID 1 の特別扱い
+    description: コンテナの PID 1（init）には、自分でハンドラを登録したシグナルしか届きません。SIGKILL でも PID 1 は名前空間の中からは殺せません。
+state_changes:
+  - 相手プロセスにシグナルが届く（終了・停止・再開など）。
+related:
+  - fork
+  - wait4
+man_pages:
+  - kill(2)
+  - signal(7)
+explain:
+  success: |
+    PID {pid} に {sig} を送りました。どう反応したかは /proc/{pid}/stat の状態欄や wait4 で確かめられます。
+  failure: |
+    PID {pid} に {sig} を送れませんでした。エラーは `{errno}`（{errno_message}）です。

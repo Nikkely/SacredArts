@@ -1,5 +1,8 @@
 //! strace-like one-line formatting of requested syscalls.
 
+use crate::process::{
+    CPU_SET_BYTES, KernelOutput, WaitStatus, format_cpus, format_timeval, format_wait_options, signal_name,
+};
 use crate::request::{Dirfd, OpenFlag, PrioWhich, SyscallRequest};
 
 /// Number of bytes of a buffer shown in formatted output (like `strace -s`).
@@ -59,8 +62,9 @@ pub fn format_mode(mode: u32) -> String {
 
 /// Format the call part, e.g. `openat(AT_FDCWD, "a", O_RDONLY)`.
 /// For `read`, the buffer is an output argument; pass the bytes actually read.
+/// `out` holds the other output arguments (`wait4`, `sched_getaffinity`).
 #[must_use]
-pub fn format_call(req: &SyscallRequest, read_data: Option<&[u8]>) -> String {
+pub fn format_call(req: &SyscallRequest, read_data: Option<&[u8]>, out: Option<&KernelOutput>) -> String {
     match req {
         SyscallRequest::Getpid => "getpid()".to_string(),
         SyscallRequest::Openat {
@@ -97,6 +101,36 @@ pub fn format_call(req: &SyscallRequest, read_data: Option<&[u8]>) -> String {
         SyscallRequest::Setpriority { which, who, prio } => {
             format!("setpriority({}, {who}, {prio})", PrioWhich::display(*which))
         }
+        SyscallRequest::Fork { .. } => "fork()".to_string(),
+        SyscallRequest::Kill { pid, sig } => format!("kill({pid}, {})", signal_name(*sig)),
+        SyscallRequest::Wait4 { pid, options } => {
+            let (status, rusage) = match out {
+                Some(KernelOutput::Wait {
+                    status,
+                    utime_us,
+                    stime_us,
+                }) => (
+                    format!("[{}]", WaitStatus::decode(*status).strace()),
+                    format!(
+                        "{{ru_utime={}, ru_stime={}, ...}}",
+                        format_timeval(*utime_us),
+                        format_timeval(*stime_us)
+                    ),
+                ),
+                _ => ("<status>".to_string(), "<rusage>".to_string()),
+            };
+            format!("wait4({pid}, {status}, {}, {rusage})", format_wait_options(*options))
+        }
+        SyscallRequest::SchedSetaffinity { pid, cpus } => {
+            format!("sched_setaffinity({pid}, {CPU_SET_BYTES}, {})", format_cpus(cpus))
+        }
+        SyscallRequest::SchedGetaffinity { pid } => {
+            let mask = match out {
+                Some(KernelOutput::Cpus { cpus }) => format_cpus(cpus),
+                _ => "<mask>".to_string(),
+            };
+            format!("sched_getaffinity({pid}, {CPU_SET_BYTES}, {mask})")
+        }
     }
 }
 
@@ -123,7 +157,7 @@ mod tests {
             mode: Some(0o644),
         };
         assert_eq!(
-            format_call(&r, None) + &format_result(3, None),
+            format_call(&r, None, None) + &format_result(3, None),
             "openat(AT_FDCWD, \"hello.txt\", O_WRONLY|O_CREAT, 0644) = 3"
         );
         let w = SyscallRequest::Write {
@@ -131,9 +165,9 @@ mod tests {
             data: b"Hello\n\0".to_vec(),
             count: 7,
         };
-        assert_eq!(format_call(&w, None), "write(3, \"Hello\\n\\0\", 7)");
+        assert_eq!(format_call(&w, None, None), "write(3, \"Hello\\n\\0\", 7)");
         let r = SyscallRequest::Read { fd: 3, count: 100 };
-        assert_eq!(format_call(&r, Some(b"Hello")), "read(3, \"Hello\", 100)");
+        assert_eq!(format_call(&r, Some(b"Hello"), None), "read(3, \"Hello\", 100)");
         assert_eq!(
             format_result(-1, Some(("EPERM", "Operation not permitted"))),
             " = -1 EPERM (Operation not permitted)"

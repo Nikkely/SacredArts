@@ -4,6 +4,7 @@
 //! the runner validates the typed request again (defence in depth).
 
 use crate::limits::{MAX_IO_BYTES, MAX_PATH_BYTES};
+use crate::process::{CPU_SET_BITS, ChildProgram, WaitOption, signal_number};
 use crate::syscall::SyscallName;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -205,7 +206,36 @@ pub enum SyscallRequest {
         who: u32,
         prio: i32,
     },
+    /// Issued as `clone(SIGCHLD)` (what glibc's `fork()` does; aarch64 has
+    /// no `fork` syscall). The child runs `child` and never returns.
+    Fork {
+        child: ChildProgram,
+        seconds: u32,
+    },
+    Kill {
+        pid: i32,
+        sig: i32,
+    },
+    Wait4 {
+        pid: i32,
+        options: i32,
+    },
+    #[serde(rename = "sched_setaffinity")]
+    SchedSetaffinity {
+        pid: i32,
+        cpus: Vec<u32>,
+    },
+    #[serde(rename = "sched_getaffinity")]
+    SchedGetaffinity {
+        pid: i32,
+    },
 }
+
+/// Longest a forked `spin`/`sleep` child runs (the sandbox's idle timeout
+/// removes the container, and so every child, anyway).
+pub const MAX_CHILD_SECONDS: u32 = 3600;
+/// Default run time of a forked child.
+pub const DEFAULT_CHILD_SECONDS: u32 = 60;
 
 /// Named values of the `which` argument of `getpriority`/`setpriority`
 /// (the same on every Linux architecture). Other numbers are passed verbatim.
@@ -260,6 +290,11 @@ impl SyscallRequest {
             SyscallRequest::Mkdirat { .. } => SyscallName::Mkdirat,
             SyscallRequest::Getpriority { .. } => SyscallName::Getpriority,
             SyscallRequest::Setpriority { .. } => SyscallName::Setpriority,
+            SyscallRequest::Fork { .. } => SyscallName::Fork,
+            SyscallRequest::Kill { .. } => SyscallName::Kill,
+            SyscallRequest::Wait4 { .. } => SyscallName::Wait4,
+            SyscallRequest::SchedSetaffinity { .. } => SyscallName::SchedSetaffinity,
+            SyscallRequest::SchedGetaffinity { .. } => SyscallName::SchedGetaffinity,
         }
     }
 
@@ -351,6 +386,16 @@ impl SyscallRequest {
                 };
                 SyscallRequest::Mkdirat { dirfd, path, mode }
             }
+            _ => Self::process_from_user(sys, &obj)?,
+        };
+        req.validate()?;
+        Ok(req)
+    }
+
+    /// Scheduling and process syscalls (see [`Self::from_user`]).
+    fn process_from_user(sys: SyscallName, obj: &Map<String, Value>) -> Result<Self, ValidationError> {
+        let obj = obj.clone();
+        Ok(match sys {
             SyscallName::Getpriority => {
                 allow_keys(&obj, &["which", "who"])?;
                 SyscallRequest::Getpriority {
@@ -366,9 +411,52 @@ impl SyscallRequest {
                     prio: parse_int(obj.get("prio"), "prio")?,
                 }
             }
-        };
-        req.validate()?;
-        Ok(req)
+            SyscallName::Fork => {
+                allow_keys(&obj, &["child", "seconds"])?;
+                SyscallRequest::Fork {
+                    child: parse_child(obj.get("child"))?,
+                    seconds: parse_seconds(obj.get("seconds"))?,
+                }
+            }
+            SyscallName::Kill => {
+                allow_keys(&obj, &["pid", "sig"])?;
+                SyscallRequest::Kill {
+                    pid: parse_int(obj.get("pid"), "pid")?,
+                    sig: parse_signal(obj.get("sig"))?,
+                }
+            }
+            SyscallName::Wait4 => {
+                allow_keys(&obj, &["pid", "options"])?;
+                SyscallRequest::Wait4 {
+                    pid: opt_int(obj.get("pid"), "pid", -1)?,
+                    options: parse_wait_options(obj.get("options"))?,
+                }
+            }
+            SyscallName::SchedSetaffinity => {
+                allow_keys(&obj, &["pid", "cpus"])?;
+                SyscallRequest::SchedSetaffinity {
+                    pid: opt_int(obj.get("pid"), "pid", 0)?,
+                    cpus: parse_cpus(obj.get("cpus"))?,
+                }
+            }
+            SyscallName::SchedGetaffinity => {
+                allow_keys(&obj, &["pid"])?;
+                SyscallRequest::SchedGetaffinity {
+                    pid: opt_int(obj.get("pid"), "pid", 0)?,
+                }
+            }
+            SyscallName::Getpid
+            | SyscallName::Openat
+            | SyscallName::Read
+            | SyscallName::Write
+            | SyscallName::Close
+            | SyscallName::Mkdirat => {
+                return Err(ValidationError::new(
+                    "unsupported_syscall",
+                    format!("{sys} is parsed by from_user"),
+                ));
+            }
+        })
     }
 
     /// Re-validate a typed request (used by the runner for defence in depth).
@@ -384,7 +472,12 @@ impl SyscallRequest {
             SyscallRequest::Getpid
             | SyscallRequest::Close { .. }
             | SyscallRequest::Getpriority { .. }
-            | SyscallRequest::Setpriority { .. } => Ok(()),
+            | SyscallRequest::Setpriority { .. }
+            | SyscallRequest::Kill { .. }
+            | SyscallRequest::Wait4 { .. }
+            | SyscallRequest::SchedGetaffinity { .. } => Ok(()),
+            SyscallRequest::Fork { seconds, .. } => check_seconds(*seconds),
+            SyscallRequest::SchedSetaffinity { cpus, .. } => check_cpus(cpus),
             SyscallRequest::Openat { path, .. } | SyscallRequest::Mkdirat { path, .. } => validate_path(path),
             SyscallRequest::Read { count, .. } => check_count(*count, "count"),
             SyscallRequest::Write { data, count, .. } => {
@@ -487,6 +580,127 @@ fn parse_int(v: Option<&Value>, field: &str) -> Result<i32, ValidationError> {
     }
     .and_then(|n| i32::try_from(n).ok())
     .ok_or_else(|| ValidationError::new("invalid_argument", format!("{field} must be an integer (C int)")).field(field))
+}
+
+fn opt_int(v: Option<&Value>, field: &str, default: i32) -> Result<i32, ValidationError> {
+    match v {
+        None | Some(Value::Null) => Ok(default),
+        v => parse_int(v, field),
+    }
+}
+
+fn parse_child(v: Option<&Value>) -> Result<ChildProgram, ValidationError> {
+    match v {
+        None | Some(Value::Null) => Ok(ChildProgram::Spin),
+        Some(Value::String(s)) => s.trim().parse().map_err(|_| bad_child()),
+        _ => Err(bad_child()),
+    }
+}
+
+fn bad_child() -> ValidationError {
+    ValidationError::new(
+        "invalid_argument",
+        format!("child must be one of {}", ChildProgram::VARIANTS.join(", ")),
+    )
+    .field("child")
+}
+
+fn parse_seconds(v: Option<&Value>) -> Result<u32, ValidationError> {
+    let n = opt_int(v, "seconds", DEFAULT_CHILD_SECONDS.cast_signed())?;
+    let s = u32::try_from(n)
+        .map_err(|_| ValidationError::new("invalid_argument", "seconds must be >= 0").field("seconds"))?;
+    check_seconds(s)?;
+    Ok(s)
+}
+
+fn check_seconds(s: u32) -> Result<(), ValidationError> {
+    if s > MAX_CHILD_SECONDS {
+        return Err(
+            ValidationError::new("limit_exceeded", format!("seconds must be at most {MAX_CHILD_SECONDS}"))
+                .field("seconds"),
+        );
+    }
+    Ok(())
+}
+
+/// `"SIGKILL"`, `"KILL"` or any int (0 checks that the process exists).
+fn parse_signal(v: Option<&Value>) -> Result<i32, ValidationError> {
+    match v {
+        None | Some(Value::Null) => Ok(15),
+        Some(Value::String(s)) if let Some(n) = signal_number(s) => Ok(n),
+        v => parse_int(v, "sig").map_err(|_| {
+            ValidationError::new(
+                "invalid_argument",
+                "sig must be a signal name like \"SIGKILL\" or an integer",
+            )
+            .field("sig")
+        }),
+    }
+}
+
+/// `["WNOHANG"]`, `"WNOHANG|WUNTRACED"` or an int.
+fn parse_wait_options(v: Option<&Value>) -> Result<i32, ValidationError> {
+    let bad = || {
+        ValidationError::new(
+            "invalid_argument",
+            format!(
+                "options must be names ({}) or an integer",
+                WaitOption::VARIANTS.join(" ")
+            ),
+        )
+        .field("options")
+    };
+    let token = |t: &str| -> Result<i32, ValidationError> {
+        t.parse::<WaitOption>()
+            .map(WaitOption::bits)
+            .or_else(|_| t.parse::<i32>())
+            .map_err(|_| bad())
+    };
+    let tokens: Vec<String> = match v {
+        None | Some(Value::Null) => vec![],
+        Some(Value::Number(n)) => vec![n.to_string()],
+        Some(Value::String(s)) => s.split('|').map(|t| t.trim().to_string()).collect(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|x| match x {
+                Value::String(s) => Ok(s.trim().to_string()),
+                Value::Number(n) => Ok(n.to_string()),
+                _ => Err(bad()),
+            })
+            .collect::<Result<_, _>>()?,
+        _ => return Err(bad()),
+    };
+    tokens
+        .iter()
+        .filter(|t| !t.is_empty())
+        .try_fold(0, |acc, t| token(t).map(|b| acc | b))
+}
+
+fn parse_cpus(v: Option<&Value>) -> Result<Vec<u32>, ValidationError> {
+    let bad =
+        || ValidationError::new("invalid_argument", "cpus must be an array of CPU numbers like [0, 1]").field("cpus");
+    let Some(Value::Array(items)) = v else {
+        return Err(if v.is_none() { missing("cpus") } else { bad() });
+    };
+    let mut cpus: Vec<u32> = items
+        .iter()
+        .map(|x| x.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(bad))
+        .collect::<Result<_, _>>()?;
+    cpus.sort_unstable();
+    cpus.dedup();
+    check_cpus(&cpus)?;
+    Ok(cpus)
+}
+
+fn check_cpus(cpus: &[u32]) -> Result<(), ValidationError> {
+    if cpus.iter().any(|c| *c >= CPU_SET_BITS) {
+        return Err(ValidationError::new(
+            "limit_exceeded",
+            format!("CPU numbers must be below {CPU_SET_BITS} (the size of cpu_set_t)"),
+        )
+        .field("cpus"));
+    }
+    Ok(())
 }
 
 /// `PRIO_PROCESS` / `PRIO_PGRP` / `PRIO_USER` or any int (default `PRIO_PROCESS`).
@@ -928,6 +1142,40 @@ mod tests {
             "invalid_argument"
         );
         assert_eq!(PrioWhich::display(1), "PRIO_PGRP");
+        assert_eq!(
+            SyscallRequest::from_user("fork", &json!({})).unwrap(),
+            SyscallRequest::Fork {
+                child: ChildProgram::Spin,
+                seconds: 60
+            }
+        );
+        assert_eq!(
+            SyscallRequest::from_user("fork", &json!({"seconds": 4000}))
+                .unwrap_err()
+                .code,
+            "limit_exceeded"
+        );
+        assert_eq!(
+            SyscallRequest::from_user("kill", &json!({"pid": 5, "sig": "STOP"})).unwrap(),
+            SyscallRequest::Kill { pid: 5, sig: 19 }
+        );
+        assert_eq!(
+            SyscallRequest::from_user("wait4", &json!({"options": ["WNOHANG", "WUNTRACED"]})).unwrap(),
+            SyscallRequest::Wait4 { pid: -1, options: 3 }
+        );
+        assert_eq!(
+            SyscallRequest::from_user("sched_setaffinity", &json!({"pid": 7, "cpus": [2, 0, 2]})).unwrap(),
+            SyscallRequest::SchedSetaffinity {
+                pid: 7,
+                cpus: vec![0, 2]
+            }
+        );
+        let r = SyscallRequest::from_user("sched_getaffinity", &json!({})).unwrap();
+        assert_eq!(r.name().as_str(), "sched_getaffinity");
+        assert_eq!(
+            serde_json::to_value(&r).unwrap(),
+            json!({"syscall": "sched_getaffinity", "pid": 0})
+        );
         assert_eq!(PrioWhich::display(9), "9");
         let r = SyscallRequest::from_user("mkdirat", &json!({"path": "d", "dirfd": "AT_FDCWD"})).unwrap();
         assert_eq!(

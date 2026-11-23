@@ -6,6 +6,7 @@
 //! ```
 
 use crate::policy::Policy;
+use crate::process::KernelOutput;
 use crate::request::{DecodedFlags, SyscallRequest};
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +134,9 @@ pub enum InvokeOutcome {
         /// openat only: the flags as the kernel received them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         open_flags: Option<DecodedFlags>,
+        /// Other output arguments the kernel filled in (wait4, sched_getaffinity).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<Box<KernelOutput>>,
     },
     /// Rejected by application-level validation; nothing was issued.
     Rejected { code: String, message: String },

@@ -1,0 +1,51 @@
+name: sched_getaffinity
+executable: true
+category: scheduling
+summary: プロセスが動いてよい CPU の集合を取得する
+description: |
+  sched_getaffinity は、プロセスが動いてよい CPU の集合（CPU アフィニティ）を読み出すシステムコールです。
+purpose: |
+  このプロセスがいくつの CPU を使えるかを知るのに使います（nproc コマンドもこれを使っています）。
+signature: |
+  #define _GNU_SOURCE
+  #include <sched.h>
+
+  int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask);
+arguments:
+  - name: pid
+    type: pid_t
+    description: 対象。0 なら呼び出し元自身。
+  - name: cpusetsize
+    type: size_t
+    description: mask のバイト数（SacredArts は 128）。
+  - name: mask
+    type: cpu_set_t *
+    description: （出力）動いてよい CPU のビット集合。
+return_value: |
+  生のシステムコールは、カーネルが mask にコピーしたバイト数を返します（glibc のラッパーは成功時に 0 を返します）。
+  失敗すると -1（errno を設定）。
+errors:
+  - name: EINVAL
+    description: cpusetsize がカーネルの CPU マスクより小さい。
+  - name: ESRCH
+    description: pid のプロセスがない。
+  - name: EPERM
+    description: SacredArts では seccomp ポリシーで sched_getaffinity を deny したときにカーネルが返します。
+flags: []
+concepts:
+  - name: --cpus と CPU の数は別物
+    description: |
+      Docker の --cpus 0.5 は「CPU 時間を全体で半分まで」という cgroup の制限（CFS bandwidth）で、使える CPU の数は減らしません。
+      だから sched_getaffinity にはホスト（VM）の CPU が全部見えます。
+state_changes:
+  - 状態は変化しません（読み取りのみ）。
+related:
+  - sched_setaffinity
+man_pages:
+  - sched_getaffinity(2)
+  - cpuset(7)
+explain:
+  success: |
+    PID {pid}（0 は自分）が動いてよい CPU は {cpus} です。戻り値 {ret} は、カーネルが mask にコピーしたバイト数です。
+  failure: |
+    PID {pid} のアフィニティを取得できませんでした。エラーは `{errno}`（{errno_message}）です。

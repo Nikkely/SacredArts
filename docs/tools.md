@@ -78,6 +78,11 @@ syscall ごとの `args`:
 | `mkdirat` | `dirfd?`, `path`, `mode?`（既定 `"0755"`。setuid などのビットもそのまま渡す） |
 | `getpriority` | `which?`: `"PRIO_PROCESS"`（既定）/ `"PRIO_PGRP"` / `"PRIO_USER"` / 整数, `who?`: 整数（既定 0 = 呼び出し元）。戻り値はカーネルの生の値 `20 - nice` |
 | `setpriority` | `which?`, `who?`, `prio`: 任意の整数（カーネルが -20〜19 に丸める） |
+| `fork` | `child?`: `"spin"`（既定）/ `"sleep"` / `"exit"`, `seconds?`: 0〜3600（既定 60）。`clone(SIGCHLD)` として発行し、子の PID を返す |
+| `kill` | `pid`: 整数, `sig?`: シグナル名（`"SIGKILL"`、`"KILL"` も可）または整数（既定 `SIGTERM`） |
+| `wait4` | `pid?`: 整数（既定 -1）, `options?`: `["WNOHANG", ...]`・`"WNOHANG\|WUNTRACED"`・整数。結果の `output` に `status`・`utime_us`・`stime_us` |
+| `sched_setaffinity` | `pid?`: 整数（既定 0）, `cpus`: CPU 番号の配列（0〜1023） |
+| `sched_getaffinity` | `pid?`: 整数（既定 0）。結果の `output.cpus` に CPU の一覧 |
 
 `flags` に使える名前は Linux の全 `O_*` フラグです: `O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_NOCTTY O_TRUNC O_APPEND O_NONBLOCK O_NDELAY O_DSYNC O_SYNC O_RSYNC O_ASYNC O_DIRECT O_LARGEFILE O_DIRECTORY O_NOFOLLOW O_NOATIME O_CLOEXEC O_PATH O_TMPFILE`。
 名前のないビットは数値（`0x40000000`、C と同じく `0` 始まりは 8 進）で混ぜられます。値はアーキテクチャごとに違うため、名前から値への変換はサンドボックス内（Runner）で行い、`kernel.runner_issued` には strace と同じ形でデコードした結果が出ます。
