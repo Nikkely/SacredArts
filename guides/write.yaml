@@ -1,0 +1,71 @@
+name: write
+executable: true
+category: filesystem
+summary: ファイルディスクリプタへデータを書き込む
+description: |
+  write は、バッファの内容を fd が指すファイルへ書き込むシステムコールです。
+  戻り値は実際に書き込めたバイト数で、要求より少ないこと（部分書き込み）もあります。
+purpose: |
+  カーネルは呼び出し側のバッファからデータを受け取り、ファイルオフセットの位置（O_APPEND なら末尾）に書き込んで、
+  オフセットを進めます。
+signature: |
+  #include <unistd.h>
+
+  ssize_t write(int fd, const void *buf, size_t count);
+arguments:
+  - name: fd
+    type: int
+    description: 書き込み先のファイルディスクリプタ。書き込み可能なモード（O_WRONLY か O_RDWR）で開かれている必要がある。
+  - name: buf
+    type: const void *
+    description: 書き込むデータが入ったバッファ。
+  - name: count
+    type: size_t
+    description: 書き込むバイト数。
+return_value: |
+  書き込んだバイト数。count より少ない場合があり（部分書き込み）、残りは呼び出し側が書き直す必要があります。
+  失敗すると -1（errno を設定）。
+errors:
+  - name: EBADF
+    description: fd が有効でない、または書き込み用に開かれていない。
+  - name: ENOSPC
+    description: デバイスに空き容量がない（SacredArts の /workspace は容量制限付きの tmpfs です）。
+  - name: EFBIG
+    description: ファイルサイズの上限を超える。
+  - name: EINTR
+    description: データを書く前にシグナルで中断された。
+  - name: EAGAIN
+    description: 非ブロッキング fd で、すぐに書き込めない。
+  - name: EPIPE
+    description: 読み手のいないパイプやソケットに書き込んだ。
+  - name: EPERM
+    description: SacredArts では seccomp ポリシーで write を deny したときにカーネルが返します。
+flags: []
+concepts:
+  - name: ファイルオフセットと O_APPEND
+    description: 書き込み位置はオープンファイル記述のオフセットで決まります。O_APPEND で開くと、毎回の書き込みの直前に末尾へ移動します。
+  - name: ページキャッシュと永続化
+    description: |
+      一般に write が成功しても、データはまずページキャッシュに入るだけで、ディスクへの書き出しは後で行われます。
+      確実に永続化したいときは fsync を使います。
+  - name: 部分書き込み（short write）
+    description: 容量不足やシグナルなどにより、count より少ないバイト数だけ書かれることがあります。
+state_changes:
+  - ファイルの内容（とサイズ）が変化する。
+  - ファイルオフセットが書き込んだバイト数だけ進む。
+related:
+  - openat
+  - read
+  - close
+man_pages:
+  - write(2)
+  - fsync(2)
+explain:
+  success: |
+    fd `{fd}` に {count} バイトを要求し、`{ret}` バイト書き込めました。{partial_note}
+  failure: |
+    write が `{errno}`（{errno_message}）で失敗しました。
+notes:
+  - |
+    SacredArts の write は data を UTF-8（既定）または base64（encoding: "base64"）で受け取ります。
+    Runner は部分書き込みを自動で再試行せず、カーネルが返した値をそのまま返します。

@@ -1,0 +1,57 @@
+name: open
+executable: false
+category: filesystem
+summary: ファイルを開く（openat の旧来の形。SacredArts では説明のみ）
+description: |
+  open はパス名でファイルを開き、ファイルディスクリプタを返すシステムコール（および libc 関数）です。
+  SacredArts では実行対象ではありません。実行するときは openat を使ってください。
+purpose: |
+  open(path, flags, mode) は openat(AT_FDCWD, path, flags, mode) と同じ意味です。
+  相対パスは常にカレントディレクトリを基準に解決されます。
+signature: |
+  #include <fcntl.h>
+
+  int open(const char *pathname, int flags,
+           ... /* mode_t mode */);
+arguments:
+  - name: pathname
+    type: const char *
+    description: 開くファイルのパス。相対パスはカレントディレクトリが基準。
+  - name: flags
+    type: int
+    description: アクセスモードとフラグ（openat と同じ）。
+  - name: mode
+    type: mode_t
+    description: O_CREAT で新規作成するときのパーミッション。
+return_value: |
+  成功すると新しいファイルディスクリプタ、失敗すると -1（errno を設定）。
+errors:
+  - name: ENOENT
+    description: ファイルが存在しない（O_CREAT なし）。
+  - name: EACCES
+    description: 権限がない。
+flags: []
+concepts:
+  - name: open と openat の関係
+    description: |
+      Linux 2.6.16 で *at 系のシステムコールが追加されました。open は openat の dirfd を AT_FDCWD に固定したものと考えられます。
+  - name: アーキテクチャによる違い
+    description: |
+      x86_64 には open システムコール（番号 2）がありますが、aarch64 のような新しいアーキテクチャには存在せず openat のみです。
+      glibc の open() はどちらのアーキテクチャでも openat システムコールを発行します。
+state_changes:
+  - openat と同じ。
+related:
+  - openat
+  - close
+man_pages:
+  - open(2)
+  - openat(2)
+explain:
+  success: ""
+  failure: ""
+notes:
+  - |
+    openat が便利な理由: ディレクトリを先に開いて dirfd として保持すれば、その後カレントディレクトリが変わったり、
+    途中のパスが別のディレクトリにすり替えられたりしても、同じディレクトリを基準にファイルを開けます。
+    スレッドごとに別の基準ディレクトリを使うこともできます。

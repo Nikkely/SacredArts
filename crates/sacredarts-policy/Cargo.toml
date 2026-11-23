@@ -1,0 +1,19 @@
+[package]
+name = "sacredarts-policy"
+description = "Compiles SacredArts learning policies into kernel seccomp-BPF filters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sacredarts-core.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+seccompiler = "0.5"
+
+[dev-dependencies]
+strum.workspace = true
+
+[lints]
+workspace = true

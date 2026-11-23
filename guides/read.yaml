@@ -1,0 +1,68 @@
+name: read
+executable: true
+category: filesystem
+summary: ファイルディスクリプタからデータを読み込む
+description: |
+  read は、fd が指すファイルから最大 count バイトを読み込むシステムコールです。
+  戻り値は実際に読めたバイト数で、ファイルの終わり（EOF）では 0 になります。
+purpose: |
+  カーネルはオープンファイル記述が持つ現在のファイルオフセットからデータを読み、呼び出し側のバッファへコピーし、
+  読んだ分だけオフセットを進めます。
+signature: |
+  #include <unistd.h>
+
+  ssize_t read(int fd, void *buf, size_t count);
+arguments:
+  - name: fd
+    type: int
+    description: 読み込み元のファイルディスクリプタ。読み込み可能なモード（O_RDONLY か O_RDWR）で開かれている必要がある。
+  - name: buf
+    type: void *
+    description: 読んだデータを書き込むバッファ（出力用の引数）。
+  - name: count
+    type: size_t
+    description: 読み込む最大バイト数。
+return_value: |
+  読み込んだバイト数（0 は EOF）。count より少ないこともあり、それはエラーではありません。失敗すると -1（errno を設定）。
+errors:
+  - name: EBADF
+    description: fd が有効でない、または読み込み用に開かれていない。
+  - name: EISDIR
+    description: fd がディレクトリを指している。
+  - name: EINTR
+    description: データを読む前にシグナルで中断された。
+  - name: EAGAIN
+    description: 非ブロッキング fd で、すぐに読めるデータがない。
+  - name: EIO
+    description: 低レベルの I/O エラー。
+  - name: EPERM
+    description: SacredArts では seccomp ポリシーで read を deny したときにカーネルが返します。
+flags: []
+concepts:
+  - name: ファイルオフセット
+    description: 「次にどこから読むか」の位置。fd 自体ではなくオープンファイル記述に保存され、read のたびに進みます。
+  - name: 部分読み込み（short read）
+    description: |
+      EOF に近い、パイプやソケットでデータが少ない、シグナルが来た、などの理由で count より少ないバイト数が返ることがあります。
+      必要なら呼び出し側がループして読み直します。
+  - name: ページキャッシュ
+    description: 通常ファイルのデータはカーネルのページキャッシュを経由してユーザー空間のバッファへコピーされるのが一般的です。
+state_changes:
+  - 成功するとファイルオフセットが読み込んだバイト数だけ進む。
+  - ファイルの内容自体は変化しない。
+related:
+  - openat
+  - write
+  - close
+man_pages:
+  - read(2)
+explain:
+  success: |
+    fd `{fd}` から最大 {count} バイトを要求し、実際には `{ret}` バイト読めました。{eof_note}
+    ファイルオフセットは読んだ分だけ進んだので、次の read は続きから読みます。
+  failure: |
+    read が `{errno}`（{errno_message}）で失敗しました。
+notes:
+  - |
+    SacredArts では 1 回の read は最大 65536 バイトです。読み込んだデータは UTF-8 として解釈できるときは data_text に、
+    常に data_base64 にも入ります（NUL バイトなどのバイナリも欠けずに扱えます）。

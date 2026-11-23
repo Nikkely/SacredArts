@@ -1,0 +1,143 @@
+name: openat
+executable: true
+category: filesystem
+summary: ファイルを開く（必要なら作成する）
+description: |
+  openat はファイルを開くためのシステムコールです。成功するとファイルディスクリプタ（fd）という番号が返り、
+  以降の read・write・close ではこの番号でファイルを指定します。
+purpose: |
+  パス名で指定したファイルを、カーネル内の「オープンファイル記述」と結びつけ、プロセスが番号（fd）で操作できるようにします。
+  open との違いは、相対パスの基準ディレクトリを dirfd で指定できる点です。
+signature: |
+  #include <fcntl.h>
+
+  int openat(int dirfd,
+             const char *pathname,
+             int flags,
+             ... /* mode_t mode */);
+arguments:
+  - name: dirfd
+    type: int
+    description: 相対パスを解決するときの基準ディレクトリの fd。AT_FDCWD ならカレントディレクトリが基準。pathname が絶対パスなら無視される。
+  - name: pathname
+    type: const char *
+    description: 開くファイルのパス。
+  - name: flags
+    type: int
+    description: アクセスモード（O_RDONLY=0 / O_WRONLY=1 / O_RDWR=2 のどれか。Linux では 3 も受け付け、権限だけ検査して read/write はできない fd になる）と、動作を変えるフラグの論理和。知らないビットは無視される。
+  - name: mode
+    type: mode_t
+    description: O_CREAT / O_TMPFILE でファイルを作るときのパーミッション。実際の値は mode & ~umask になる（setuid などの上位ビットも含めて渡せる）。C で省略すると不定値が渡るが、SacredArts では 0 を渡す。
+return_value: |
+  成功すると新しいファイルディスクリプタ（その時点で未使用の最小の番号）。失敗すると -1 を返し、errno が設定されます。
+errors:
+  - name: ENOENT
+    description: ファイルが存在せず、O_CREAT も指定されていない。またはパスの途中のディレクトリが存在しない。
+  - name: EEXIST
+    description: O_CREAT と O_EXCL を指定したが、ファイルがすでに存在する。
+  - name: EISDIR
+    description: ディレクトリを書き込み用に開こうとした。
+  - name: ENOTDIR
+    description: パスの途中がディレクトリではない、または O_DIRECTORY を指定したのに対象がディレクトリではない。
+  - name: ELOOP
+    description: O_NOFOLLOW を指定していて最後の要素がシンボリックリンクだった、またはシンボリックリンクが多すぎる。
+  - name: EACCES
+    description: 権限がない（ディレクトリの検索権限、ファイルの読み書き権限など）。
+  - name: EMFILE
+    description: プロセスが開ける fd の上限（RLIMIT_NOFILE。SacredArts のコンテナでは 256）に達した。
+  - name: ENAMETOOLONG
+    description: パス全体が PATH_MAX（4096 バイト）を超えた、またはパスの 1 要素が NAME_MAX（多くのファイルシステムで 255 バイト）を超えた。
+  - name: EINVAL
+    description: フラグの組み合わせが不正（例 O_TMPFILE に書き込み可能なアクセスモードがない、O_DIRECT をファイルシステムが扱えない）。
+  - name: EOPNOTSUPP
+    description: ファイルシステムが O_TMPFILE に対応していない。
+  - name: EBADF
+    description: dirfd が有効な fd ではない。
+  - name: EROFS
+    description: 読み取り専用ファイルシステム上のファイルを書き込み用に開こうとした、または作ろうとした（SacredArts のコンテナではルート FS が読み取り専用で、書き込めるのは /workspace と /tmp だけです）。
+  - name: EPERM
+    description: SacredArts では seccomp ポリシーで openat を deny したときにカーネルが返します。
+flags:
+  - name: O_RDONLY
+    description: 読み込み専用で開く（値は 0）。
+  - name: O_WRONLY
+    description: 書き込み専用で開く。
+  - name: O_RDWR
+    description: 読み書き両用で開く。
+  - name: O_CREAT
+    description: ファイルがなければ作成する。このとき mode が使われる。
+  - name: O_EXCL
+    description: O_CREAT と一緒に使い、ファイルがすでにあれば EEXIST で失敗させる（排他的な作成）。
+  - name: O_TRUNC
+    description: 書き込み可能で開いた通常ファイルの長さを 0 にする。
+  - name: O_APPEND
+    description: 毎回の write の前にファイルオフセットを末尾へ移動する。
+  - name: O_DIRECTORY
+    description: 対象がディレクトリでなければ失敗させる。
+  - name: O_NOFOLLOW
+    description: 最後の要素がシンボリックリンクなら追跡せず ELOOP で失敗させる。
+  - name: O_CLOEXEC
+    description: exec 時に自動で閉じる（close-on-exec）フラグを fd に付ける。
+  - name: O_NOCTTY
+    description: 端末を開いても、それをプロセスの制御端末にしない。
+  - name: O_NONBLOCK
+    description: 非ブロッキングモードで開く。FIFO などで待つ代わりにすぐ戻る（データがなければ EAGAIN）。
+  - name: O_NDELAY
+    description: O_NONBLOCK の別名（同じ値）。
+  - name: O_DSYNC
+    description: write のたびに、データ（と読み出しに必要なメタデータ）が記憶装置に書かれるまで待つ。
+  - name: O_SYNC
+    description: write のたびに、データとすべてのメタデータが記憶装置に書かれるまで待つ（O_DSYNC のビットを含む）。
+  - name: O_RSYNC
+    description: Linux では O_SYNC と同じ値。
+  - name: O_ASYNC
+    description: 入出力が可能になったときにシグナルで通知する（openat では実質的に無視され、fcntl で設定する）。
+  - name: O_DIRECT
+    description: ページキャッシュを通さずに直接入出力する。バッファの整列が必要で、tmpfs などでは EINVAL になる。
+  - name: O_LARGEFILE
+    description: 2 GiB を超えるファイルを扱えるようにする。64 ビット環境ではカーネルが常に付ける。
+  - name: O_NOATIME
+    description: read してもアクセス時刻を更新しない。ファイルの所有者でないと EPERM。
+  - name: O_PATH
+    description: ファイルを開かずに、場所だけを指す fd を得る。read/write はできない（EBADF）が、*at 系の dirfd などに使える。
+  - name: O_TMPFILE
+    description: 指定したディレクトリに名前のない一時ファイルを作る（O_DIRECTORY のビットを含む）。書き込み可能なアクセスモードと mode が必要。
+concepts:
+  - name: Virtual File System（VFS）
+    description: ファイルシステムの種類（ext4、tmpfs など）の違いを吸収する、カーネル内の共通層です。openat はまず VFS に届きます。
+  - name: パス解決（path resolution）
+    description: パス名を先頭から 1 要素ずつたどり、各ディレクトリの検索権限やシンボリックリンクを処理して対象の inode を見つける処理です。
+  - name: ファイルディスクリプタテーブル
+    description: プロセスごとの「番号 → オープンファイル記述」の表。openat は空いている最小の番号に新しいエントリを作ります。
+  - name: オープンファイル記述（open file description）
+    description: ファイルオフセットやアクセスモードを保持するカーネル内のオブジェクトです。read/write のオフセットはここに記録されます。
+  - name: パーミッションと umask
+    description: 新規作成時の権限は mode からプロセスの umask のビットを落とした値になります（例 0644 & ~022 = 0644）。
+state_changes:
+  - プロセスの fd テーブルに新しいエントリが追加される。
+  - O_CREAT で新しいファイル（inode とディレクトリエントリ）が作られることがある。
+  - O_TRUNC でファイルの内容が空になることがある。
+related:
+  - open
+  - read
+  - write
+  - close
+  - mkdirat
+man_pages:
+  - openat(2)
+  - open(2)
+  - openat2(2)
+  - path_resolution(7)
+explain:
+  success: |
+    今回は `{path}` を{flags_ja}状態にしています。
+    戻り値の `{ret}` はファイルディスクリプタです（カーネルが返した値そのもの）。
+    以降の read・write・close ではこの `{ret}` を指定します。
+  failure: |
+    `{path}` を開けませんでした。エラーは `{errno}`（{errno_message}）です。
+notes:
+  - |
+    open と openat の違い: open(path, flags, mode) は openat(AT_FDCWD, path, flags, mode) と同じ意味です。
+    openat は dirfd を基準に相対パスを解決できるため、「先にディレクトリを開いてから、その中のファイルを開く」ことで、
+    途中でパスがすり替えられる競合（TOCTOU）を避けられます。aarch64 には open システムコール自体が存在せず、
+    glibc の open() は内部で openat を呼びます。

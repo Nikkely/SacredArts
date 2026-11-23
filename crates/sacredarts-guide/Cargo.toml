@@ -1,0 +1,18 @@
+[package]
+name = "sacredarts-guide"
+description = "Structured syscall guide data and the Level 1-3 guide renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sacredarts-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng = "0.10"
+
+[dev-dependencies]
+strum.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "sacredarts-tracer"
+description = "strace output parser and the in-container supervisor for SacredArts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sacredarts-supervisor"
+path = "src/bin/sacredarts-supervisor.rs"
+
+[dependencies]
+sacredarts-core.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+sacredarts-policy.workspace = true
+
+[lints]
+workspace = true
