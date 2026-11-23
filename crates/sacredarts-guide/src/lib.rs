@@ -319,7 +319,7 @@ fn explanation(g: &SyscallGuide, v: &InvocationView<'_>) -> String {
                 } else if v.denied_by_policy {
                     write!(
                         s,
-                        "\nこれはファイルシステムの問題ではありません。現在のポリシーで {0} が deny されているため、\
+                        "\nこれは引数や権限の問題ではありません。現在のポリシーで {0} が deny されているため、\
                      カーネルの seccomp フィルタが {0} の実行前に {1} を返しました。",
                         g.name, e.name
                     )?;

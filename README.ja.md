@@ -232,7 +232,7 @@ mkdirat(AT_FDCWD, "test", 0755) = -1 EPERM (Operation not permitted)
 
 解説:
 ...
-これはファイルシステムの問題ではありません。現在のポリシーで mkdirat が deny されているため、カーネルの seccomp フィルタが mkdirat の実行前に EPERM を返しました。
+これは引数や権限の問題ではありません。現在のポリシーで mkdirat が deny されているため、カーネルの seccomp フィルタが mkdirat の実行前に EPERM を返しました。
 
 >>> trace_get {"limit": 12}
 #2 requested req-1 openat(AT_FDCWD, "/workspace/hello.txt", O_WRONLY|O_CREAT, 0644) = 3
