@@ -6,7 +6,7 @@ SacredArts は AI に Linux の syscall を実行させます。そのため「�
 
 ## 1. AI が操作できる範囲
 
-- 実行できるのは `getpid` `openat` `read` `write` `close` `mkdirat` のみ。名前の完全一致で判定し、それ以外は `unsupported_syscall`。
+- 実行できるのは `getpid` `openat` `read` `write` `close` `mkdirat` `getpriority` `setpriority` のみ。名前の完全一致で判定し、それ以外は `unsupported_syscall`。
 - 任意の syscall 番号、任意のメモリアドレス、任意のコマンド、`fork`/`execve` は扱いません。
 - 引数（fd 番号、フラグ、mode、パス）は **そのままカーネルに渡します**。アプリ側で弾くのは、渡す形にできないもの（パス中の NUL、`data` より大きい `count`）と、IPC で運べない大きさ（read/write 64 KiB、パス 64 KiB）だけです。
   - フラグは Linux の全 `O_*` 名と数値を受け付けます。アクセスモードの組み合わせ（`O_WRONLY|O_RDWR` = 3 など）もそのまま渡します。

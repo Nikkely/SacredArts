@@ -29,6 +29,8 @@ mod linux {
             SyscallName::Write => libc::SYS_write,
             SyscallName::Close => libc::SYS_close,
             SyscallName::Mkdirat => libc::SYS_mkdirat,
+            SyscallName::Getpriority => libc::SYS_getpriority,
+            SyscallName::Setpriority => libc::SYS_setpriority,
         }) as i64
     }
 

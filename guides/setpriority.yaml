@@ -1,0 +1,73 @@
+name: setpriority
+executable: true
+category: scheduling
+summary: プロセスのスケジューリング優先度（nice 値）を変更する
+description: |
+  setpriority は、プロセス・プロセスグループ・ユーザーの nice 値を変えるシステムコールです。
+  成功すると 0 を返します。範囲外の値（20 以上や -21 以下）はエラーにならず、カーネルが -20〜19 に丸めます。
+purpose: |
+  nice 値を上げる（CPU を譲る）のは誰でもできますが、下げる（CPU を多く取る）には特権が要ります。
+  1 人のユーザーが勝手に自分を最優先にして他人の処理を押しのけられないようにするためです。
+signature: |
+  #include <sys/resource.h>
+
+  int setpriority(int which, id_t who, int prio);
+arguments:
+  - name: which
+    type: int
+    description: 対象の種類。PRIO_PROCESS / PRIO_PGRP / PRIO_USER。
+  - name: who
+    type: id_t
+    description: PID / PGID / UID。0 は呼び出し元自身。
+  - name: prio
+    type: int
+    description: 新しい nice 値。-20〜19 の範囲外はカーネルが丸める。
+return_value: |
+  成功すると 0。失敗すると -1（errno を設定）。
+errors:
+  - name: EACCES
+    description: |
+      nice 値を今より小さく（優先度を高く）しようとしたが、CAP_SYS_NICE を持っておらず、RLIMIT_NICE の上限も超えている。
+      SacredArts のコンテナは全 capability を外した一般ユーザーで動き、RLIMIT_NICE は 0 なので、一度上げた nice は元に戻せません。
+  - name: EPERM
+    description: |
+      対象プロセスの所有者（実 UID / 実効 UID）が呼び出し元の実効 UID と一致しない（他人のプロセスは変えられない）。
+      SacredArts では seccomp ポリシーで setpriority を deny したときにもカーネルが返します。
+  - name: ESRCH
+    description: which と who の組み合わせに当てはまるプロセスがない。
+  - name: EINVAL
+    description: which が PRIO_PROCESS / PRIO_PGRP / PRIO_USER のどれでもない。
+flags: []
+concepts:
+  - name: CAP_SYS_NICE
+    description: nice 値を下げる・他人のプロセスの nice を変えるための capability（root の権限を細かく分けたもの）。
+  - name: RLIMIT_NICE
+    description: |
+      特権なしで下げられる nice の下限を決めるリソース制限です。上限値 r のとき nice を 20 - r まで下げられます。
+      既定の 0 では、一般ユーザーは nice を一切下げられません。
+  - name: 一方通行の nice
+    description: |
+      一般ユーザーは nice を上げられても下げられないため、一度 10 にしたプロセスは 0 に戻せません。
+      元の値に戻すことも「優先度を上げる」操作として扱われるからです。
+  - name: 重みと CPU の取り分
+    description: |
+      nice 0 の重みは 1024、nice 10 は 110、nice 19 は 15 です。nice 0 と nice 19 のプロセスが 1 つの CPU を取り合うと、
+      取り分はおよそ 1024 : 15（約 98.5% : 1.5%）になります。
+state_changes:
+  - 対象プロセス（またはグループ・ユーザーの全プロセス）の nice 値が変わる。子プロセスは fork 時にこの値を引き継ぐ。
+related:
+  - getpriority
+man_pages:
+  - setpriority(2)
+  - sched(7)
+  - capabilities(7)
+  - getrlimit(2)
+explain:
+  success: |
+    {which}（who={who}）の nice 値を {effective} に設定しました。{clamp_note}
+    getpriority で確かめると、生の戻り値は 20 - {effective} になるはずです。
+  failure: |
+    {which}（who={who}）の nice 値を {prio} にできませんでした。エラーは `{errno}`（{errno_message}）です。
+notes:
+  - |
+    glibc の nice(3) は内部で getpriority と setpriority を組み合わせて実装されています。

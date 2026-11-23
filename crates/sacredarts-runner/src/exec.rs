@@ -17,7 +17,7 @@ use base64::Engine;
 use sacredarts_core::format::{DISPLAY_BYTES, format_mode, quote_bytes, quote_str};
 use sacredarts_core::ipc::{HandleChange, InvokeOutcome, IssuedCall, IssuedPurpose};
 use sacredarts_core::limits::MARKER_PREFIX;
-use sacredarts_core::{DecodedFlags, Dirfd, OpenFlag, SyscallRequest, ValidationError};
+use sacredarts_core::{DecodedFlags, Dirfd, OpenFlag, PrioWhich, SyscallRequest, ValidationError};
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
@@ -166,6 +166,8 @@ impl Runner {
             SyscallRequest::Write { fd, data, count } => self.write(*fd, &data[..*count]),
             SyscallRequest::Close { fd } => self.close(*fd),
             SyscallRequest::Mkdirat { dirfd, path, mode } => self.mkdirat(*dirfd, path, *mode),
+            SyscallRequest::Getpriority { which, who } => Ok(Self::getpriority(*which, *who)),
+            SyscallRequest::Setpriority { which, who, prio } => Ok(Self::setpriority(*which, *who, *prio)),
         };
         r.unwrap_or_else(|v| InvokeOutcome::Rejected {
             code: v.code,
@@ -339,6 +341,26 @@ impl Runner {
             format!("{shown}, {}, {}", quote_str(path), format_mode(mode)),
             r,
         ))
+    }
+
+    /// The raw syscall, not glibc's wrapper: the kernel returns `20 - nice`
+    /// (1..=40) so that a valid result is never negative; glibc subtracts it
+    /// back. SacredArts shows the kernel's value.
+    fn getpriority(which: i32, who: u32) -> InvokeOutcome {
+        // SAFETY: getpriority only takes integers.
+        let r = result(unsafe { libc::syscall(libc::SYS_getpriority, which, who) });
+        Self::plain("getpriority", format!("{}, {who}", PrioWhich::display(which)), r)
+    }
+
+    /// `prio` goes to the kernel verbatim; out-of-range values are clamped there.
+    fn setpriority(which: i32, who: u32, prio: i32) -> InvokeOutcome {
+        // SAFETY: setpriority only takes integers.
+        let r = result(unsafe { libc::syscall(libc::SYS_setpriority, which, who, prio) });
+        Self::plain(
+            "setpriority",
+            format!("{}, {who}, {prio}", PrioWhich::display(which)),
+            r,
+        )
     }
 }
 

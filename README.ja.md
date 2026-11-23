@@ -30,7 +30,7 @@ SacredArts は、AI エージェントが Linux のシステムコールを **�
 
 | 機能 | 内容 |
 |---|---|
-| Execution | `getpid` `openat` `read` `write` `close` `mkdirat` を Docker 上の Linux で実行。fd などの状態はセッション内で保持 |
+| Execution | `getpid` `openat` `read` `write` `close` `mkdirat` `getpriority` `setpriority` を Docker 上の Linux で実行。fd などの状態はセッション内で保持 |
 | Observation | Runner を `strace` の子プロセスとして起動し、カーネルに実際に発行された syscall を観測。AI の要求（requested）と観測（observed）を区別して記録 |
 | Control | seccomp-BPF でカーネルレベルに syscall を拒否（例: `mkdirat` → `EPERM`） |
 | Guidance | Level 1〜3 で解説の詳しさを切り替え。解説は man-pages ベースの構造化データ（`guides/*.yaml`）と実行結果から生成 |
@@ -186,6 +186,8 @@ Level 3 では「今回実測したこと」と「Linux の一般的な仕様」
 | `write` | `fd`, `data`, `encoding?`（`utf8`/`base64`）, `count?` | 部分書き込みはそのまま返す |
 | `close` | `fd`（任意の整数） | |
 | `mkdirat` | `dirfd?`, `path`, `mode?`（既定 `"0755"`。どのビットも可） | |
+| `getpriority` | `which?`（`PRIO_PROCESS`（既定）/`PRIO_PGRP`/`PRIO_USER` か整数）, `who?`（既定 0 = 自分） | カーネルの生の戻り値 `20 - nice` を返す |
+| `setpriority` | `which?`, `who?`, `prio` | 範囲外の値はカーネルが -20〜19 に丸める。nice を下げるには CAP_SYS_NICE が要る |
 | `open` | —（`syscall_describe` のみ） | `open` と `openat` の違いの説明用 |
 
 カレントディレクトリは `/workspace` です。パスは制限せずそのままカーネルに渡すので、`/etc/passwd` なども開けます（コンテナ内のファイルです）。

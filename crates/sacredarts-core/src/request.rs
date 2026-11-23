@@ -194,7 +194,54 @@ pub enum SyscallRequest {
         path: String,
         mode: u32,
     },
+    /// `which` and `who` select the target (see [`PrioWhich`]).
+    Getpriority {
+        which: i32,
+        who: u32,
+    },
+    /// `prio` is passed verbatim; the kernel clamps it to -20..=19.
+    Setpriority {
+        which: i32,
+        who: u32,
+        prio: i32,
+    },
 }
+
+/// Named values of the `which` argument of `getpriority`/`setpriority`
+/// (the same on every Linux architecture). Other numbers are passed verbatim.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, EnumString, IntoStaticStr, VariantNames)]
+pub enum PrioWhich {
+    PRIO_PROCESS,
+    PRIO_PGRP,
+    PRIO_USER,
+}
+
+impl PrioWhich {
+    #[must_use]
+    pub fn value(self) -> i32 {
+        match self {
+            PrioWhich::PRIO_PROCESS => 0,
+            PrioWhich::PRIO_PGRP => 1,
+            PrioWhich::PRIO_USER => 2,
+        }
+    }
+
+    #[must_use]
+    pub fn from_value(v: i32) -> Option<Self> {
+        PrioWhich::iter().find(|w| w.value() == v)
+    }
+
+    /// `PRIO_PROCESS` etc., or the number for values without a name.
+    #[must_use]
+    pub fn display(v: i32) -> String {
+        Self::from_value(v).map_or_else(|| v.to_string(), |w| <&str>::from(w).to_string())
+    }
+}
+
+/// The kernel's nice range. Values outside it are clamped by `setpriority`.
+pub const NICE_MIN: i32 = -20;
+pub const NICE_MAX: i32 = 19;
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
 fn is_zero(v: &u32) -> bool {
@@ -211,6 +258,8 @@ impl SyscallRequest {
             SyscallRequest::Write { .. } => SyscallName::Write,
             SyscallRequest::Close { .. } => SyscallName::Close,
             SyscallRequest::Mkdirat { .. } => SyscallName::Mkdirat,
+            SyscallRequest::Getpriority { .. } => SyscallName::Getpriority,
+            SyscallRequest::Setpriority { .. } => SyscallName::Setpriority,
         }
     }
 
@@ -302,6 +351,21 @@ impl SyscallRequest {
                 };
                 SyscallRequest::Mkdirat { dirfd, path, mode }
             }
+            SyscallName::Getpriority => {
+                allow_keys(&obj, &["which", "who"])?;
+                SyscallRequest::Getpriority {
+                    which: parse_which(obj.get("which"))?,
+                    who: parse_who(obj.get("who"))?,
+                }
+            }
+            SyscallName::Setpriority => {
+                allow_keys(&obj, &["which", "who", "prio"])?;
+                SyscallRequest::Setpriority {
+                    which: parse_which(obj.get("which"))?,
+                    who: parse_who(obj.get("who"))?,
+                    prio: parse_int(obj.get("prio"), "prio")?,
+                }
+            }
         };
         req.validate()?;
         Ok(req)
@@ -317,7 +381,10 @@ impl SyscallRequest {
     /// `invalid_argument` if `count` exceeds the data of a `write`.
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
-            SyscallRequest::Getpid | SyscallRequest::Close { .. } => Ok(()),
+            SyscallRequest::Getpid
+            | SyscallRequest::Close { .. }
+            | SyscallRequest::Getpriority { .. }
+            | SyscallRequest::Setpriority { .. } => Ok(()),
             SyscallRequest::Openat { path, .. } | SyscallRequest::Mkdirat { path, .. } => validate_path(path),
             SyscallRequest::Read { count, .. } => check_count(*count, "count"),
             SyscallRequest::Write { data, count, .. } => {
@@ -408,6 +475,49 @@ fn parse_fd(v: Option<&Value>, field: &str) -> Result<i32, ValidationError> {
         ValidationError::new("invalid_argument", format!("{field} must be an integer (C int)")).field(field)
     })?;
     Ok(n)
+}
+
+/// Any C `int`; the kernel decides what it means.
+fn parse_int(v: Option<&Value>, field: &str) -> Result<i32, ValidationError> {
+    let v = v.ok_or_else(|| missing(field))?;
+    match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+    .and_then(|n| i32::try_from(n).ok())
+    .ok_or_else(|| ValidationError::new("invalid_argument", format!("{field} must be an integer (C int)")).field(field))
+}
+
+/// `PRIO_PROCESS` / `PRIO_PGRP` / `PRIO_USER` or any int (default `PRIO_PROCESS`).
+fn parse_which(v: Option<&Value>) -> Result<i32, ValidationError> {
+    match v {
+        None | Some(Value::Null) => Ok(PrioWhich::PRIO_PROCESS.value()),
+        Some(Value::String(s)) if let Ok(w) = s.trim().parse::<PrioWhich>() => Ok(w.value()),
+        Some(v) => parse_int(Some(v), "which").map_err(|_| {
+            ValidationError::new(
+                "invalid_argument",
+                format!("which must be one of {} or an integer", PrioWhich::VARIANTS.join(", ")),
+            )
+            .field("which")
+        }),
+    }
+}
+
+/// `id_t` (unsigned). 0 means "the caller" (its process, group or user).
+/// Negative ints are reinterpreted as their bit pattern, as in C.
+fn parse_who(v: Option<&Value>) -> Result<u32, ValidationError> {
+    let bad = || ValidationError::new("invalid_argument", "who must be an integer (id_t)").field("who");
+    let n = match v {
+        None | Some(Value::Null) => return Ok(0),
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+    .ok_or_else(bad)?;
+    u32::try_from(n)
+        .or_else(|_| i32::try_from(n).map(i32::cast_unsigned))
+        .map_err(|_| bad())
 }
 
 fn parse_path(v: Option<&Value>) -> Result<String, ValidationError> {
@@ -786,6 +896,39 @@ mod tests {
             SyscallRequest::from_user("execve", &json!({})).unwrap_err().code,
             "unsupported_syscall"
         );
+        let r = SyscallRequest::from_user("getpriority", &json!({})).unwrap();
+        assert_eq!(r, SyscallRequest::Getpriority { which: 0, who: 0 });
+        let r =
+            SyscallRequest::from_user("setpriority", &json!({"which": "PRIO_USER", "who": 5, "prio": -100})).unwrap();
+        assert_eq!(
+            r,
+            SyscallRequest::Setpriority {
+                which: 2,
+                who: 5,
+                prio: -100
+            }
+        );
+        let r = SyscallRequest::from_user("setpriority", &json!({"which": 7, "who": -1, "prio": "3"})).unwrap();
+        assert_eq!(
+            r,
+            SyscallRequest::Setpriority {
+                which: 7,
+                who: u32::MAX,
+                prio: 3
+            }
+        );
+        assert_eq!(
+            SyscallRequest::from_user("setpriority", &json!({})).unwrap_err().code,
+            "missing_argument"
+        );
+        assert_eq!(
+            SyscallRequest::from_user("getpriority", &json!({"which": "PRIO_NOPE"}))
+                .unwrap_err()
+                .code,
+            "invalid_argument"
+        );
+        assert_eq!(PrioWhich::display(1), "PRIO_PGRP");
+        assert_eq!(PrioWhich::display(9), "9");
         let r = SyscallRequest::from_user("mkdirat", &json!({"path": "d", "dirfd": "AT_FDCWD"})).unwrap();
         assert_eq!(
             r,

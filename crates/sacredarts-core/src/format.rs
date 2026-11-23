@@ -1,6 +1,6 @@
 //! strace-like one-line formatting of requested syscalls.
 
-use crate::request::{Dirfd, OpenFlag, SyscallRequest};
+use crate::request::{Dirfd, OpenFlag, PrioWhich, SyscallRequest};
 
 /// Number of bytes of a buffer shown in formatted output (like `strace -s`).
 pub const DISPLAY_BYTES: usize = 32;
@@ -93,6 +93,10 @@ pub fn format_call(req: &SyscallRequest, read_data: Option<&[u8]>) -> String {
             quote_str(path),
             format_mode(*mode)
         ),
+        SyscallRequest::Getpriority { which, who } => format!("getpriority({}, {who})", PrioWhich::display(*which)),
+        SyscallRequest::Setpriority { which, who, prio } => {
+            format!("setpriority({}, {who}, {prio})", PrioWhich::display(*which))
+        }
     }
 }
 

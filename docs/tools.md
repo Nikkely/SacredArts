@@ -76,6 +76,8 @@ syscall ごとの `args`:
 | `write` | `fd`: 任意の整数, `data`: 文字列, `encoding?`: `"utf8"`（既定）/ `"base64"`, `count?`: 書き込むバイト数（既定は全量、`data` 長以下） |
 | `close` | `fd`: 任意の整数 |
 | `mkdirat` | `dirfd?`, `path`, `mode?`（既定 `"0755"`。setuid などのビットもそのまま渡す） |
+| `getpriority` | `which?`: `"PRIO_PROCESS"`（既定）/ `"PRIO_PGRP"` / `"PRIO_USER"` / 整数, `who?`: 整数（既定 0 = 呼び出し元）。戻り値はカーネルの生の値 `20 - nice` |
+| `setpriority` | `which?`, `who?`, `prio`: 任意の整数（カーネルが -20〜19 に丸める） |
 
 `flags` に使える名前は Linux の全 `O_*` フラグです: `O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_NOCTTY O_TRUNC O_APPEND O_NONBLOCK O_NDELAY O_DSYNC O_SYNC O_RSYNC O_ASYNC O_DIRECT O_LARGEFILE O_DIRECTORY O_NOFOLLOW O_NOATIME O_CLOEXEC O_PATH O_TMPFILE`。
 名前のないビットは数値（`0x40000000`、C と同じく `0` 始まりは 8 進）で混ぜられます。値はアーキテクチャごとに違うため、名前から値への変換はサンドボックス内（Runner）で行い、`kernel.runner_issued` には strace と同じ形でデコードした結果が出ます。

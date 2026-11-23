@@ -534,3 +534,47 @@ fn denying_openat_keeps_mkdirat() {
     ok(&rn.call("mkdirat", &json!({"path": "a"})));
     ok(&rn.call("mkdirat", &json!({"path": "a/b"})));
 }
+
+/// Field `n` (1-based) of `/proc/<pid>/stat`, counting after the `(comm)`.
+fn stat_field(pid: i32, n: usize) -> i64 {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let after = &s[s.rfind(')').unwrap() + 2..];
+    after.split(' ').nth(n - 3).unwrap().parse().unwrap()
+}
+
+#[test]
+fn nice_is_set_raw_and_clamped_by_the_kernel() {
+    let mut rn = Rn::start("nice", &Policy::default());
+    let pid = rn.hello.pid;
+    // the raw syscall returns 20 - nice
+    assert_eq!(ok(&rn.call("getpriority", &json!({}))), 20 - stat_field(pid, 19));
+    assert_eq!(ok(&rn.call("setpriority", &json!({"prio": 10}))), 0);
+    assert_eq!(ok(&rn.call("getpriority", &json!({}))), 10);
+    assert_eq!(stat_field(pid, 19), 10, "nice field of /proc/<pid>/stat");
+    assert_eq!(stat_field(pid, 18), 30, "priority = 20 + nice");
+    // out of range: no error, clamped to 19
+    assert_eq!(
+        ok(&rn.call(
+            "setpriority",
+            &json!({"which": "PRIO_PROCESS", "who": pid, "prio": 100})
+        )),
+        0
+    );
+    assert_eq!(ok(&rn.call("getpriority", &json!({"who": pid}))), 1);
+    // lowering nice needs CAP_SYS_NICE (or RLIMIT_NICE)
+    // SAFETY: geteuid cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(errno_of(&rn.call("setpriority", &json!({"prio": 0}))), "EACCES");
+    }
+    assert_eq!(errno_of(&rn.call("getpriority", &json!({"which": 9}))), "EINVAL");
+    assert_eq!(errno_of(&rn.call("getpriority", &json!({"who": 999_999}))), "ESRCH");
+}
+
+#[test]
+fn seccomp_denies_setpriority_in_kernel() {
+    let policy = Policy::from_user(&["setpriority".into()], Some("EPERM")).unwrap();
+    let mut rn = Rn::start("nicesec", &policy);
+    assert_eq!(errno_of(&rn.call("setpriority", &json!({"prio": 5}))), "EPERM");
+    assert_eq!(stat_field(rn.hello.pid, 19), 0, "nice unchanged");
+    assert_eq!(ok(&rn.call("getpriority", &json!({}))), 20);
+}

@@ -13,5 +13,5 @@ pub mod syscall;
 
 pub use modes::{GuideLevel, TraceMode};
 pub use policy::{DenyErrno, Policy};
-pub use request::{DecodedFlags, Dirfd, OpenFlag, SyscallRequest, ValidationError};
+pub use request::{DecodedFlags, Dirfd, NICE_MAX, NICE_MIN, OpenFlag, PrioWhich, SyscallRequest, ValidationError};
 pub use syscall::SyscallName;

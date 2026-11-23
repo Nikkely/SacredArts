@@ -109,4 +109,4 @@ notes: []                 # 補足（open と openat の違いなど）
 
 テンプレートで使える値: `{ret}` `{real_fd}` `{errno}` `{errno_message}` `{path}` `{flags_ja}` `{mode}` `{fd}` `{count}` `{eof_note}` `{partial_note}`（syscall により異なる）。
 
-収録: `getpid` `openat` `read` `write` `close` `mkdirat`（実行可能）、`open`（説明のみ）。
+収録: `getpid` `openat` `read` `write` `close` `mkdirat` `getpriority` `setpriority`（実行可能）、`open`（説明のみ）。

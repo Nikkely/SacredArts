@@ -31,7 +31,7 @@
 
 ## 4. 対応 syscall
 
-`getpid` `openat` `read` `write` `close` `mkdirat`（実行可能）、`open`（`syscall_describe` のみ）。
+`getpid` `openat` `read` `write` `close` `mkdirat` `getpriority` `setpriority`（実行可能）、`open`（`syscall_describe` のみ）。
 
 ## 5. 主要な仕様（実装の要点）
 

@@ -7,7 +7,7 @@
 
 use sacredarts_core::format::{DISPLAY_BYTES, format_dirfd, format_flags, format_mode, quote_bytes, quote_str};
 use sacredarts_core::ipc::{ErrnoInfo, HandleInfo, IssuedCall, IssuedPurpose, Observation, ObservationStatus};
-use sacredarts_core::{DecodedFlags, GuideLevel, OpenFlag, SyscallRequest, TraceMode};
+use sacredarts_core::{DecodedFlags, GuideLevel, NICE_MAX, NICE_MIN, OpenFlag, PrioWhich, SyscallRequest, TraceMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -65,6 +65,8 @@ const BUILTIN: &[(&str, &str)] = &[
     ("write", include_str!("../../../guides/write.yaml")),
     ("close", include_str!("../../../guides/close.yaml")),
     ("mkdirat", include_str!("../../../guides/mkdirat.yaml")),
+    ("getpriority", include_str!("../../../guides/getpriority.yaml")),
+    ("setpriority", include_str!("../../../guides/setpriority.yaml")),
 ];
 
 pub struct Guides {
@@ -232,6 +234,29 @@ fn fill(template: &str, v: &InvocationView<'_>) -> String {
         }
         SyscallRequest::Close { fd } => vec![("fd", fd.to_string())],
         SyscallRequest::Getpid => vec![],
+        SyscallRequest::Getpriority { which, who } => vec![
+            ("which", PrioWhich::display(*which)),
+            ("who", who.to_string()),
+            // The raw syscall returns 20 - nice.
+            ("nice", (20 - v.ret).to_string()),
+        ],
+        SyscallRequest::Setpriority { which, who, prio } => {
+            let effective = (*prio).clamp(NICE_MIN, NICE_MAX);
+            let note = if effective == *prio {
+                String::new()
+            } else {
+                format!(
+                    "要求値 {prio} は範囲外なので、カーネルは黙って {effective} に丸めました（エラーにはなりません）。"
+                )
+            };
+            vec![
+                ("which", PrioWhich::display(*which)),
+                ("who", who.to_string()),
+                ("prio", prio.to_string()),
+                ("effective", effective.to_string()),
+                ("clamp_note", note),
+            ]
+        }
     };
     common
         .into_iter()
@@ -343,6 +368,15 @@ fn arg_values(req: &SyscallRequest, v: &InvocationView<'_>) -> Vec<(String, Stri
             ("dirfd".into(), format_dirfd(*dirfd)),
             ("pathname".into(), quote_str(path)),
             ("mode".into(), format_mode(*mode)),
+        ],
+        SyscallRequest::Getpriority { which, who } => vec![
+            ("which".into(), PrioWhich::display(*which)),
+            ("who".into(), who.to_string()),
+        ],
+        SyscallRequest::Setpriority { which, who, prio } => vec![
+            ("which".into(), PrioWhich::display(*which)),
+            ("who".into(), who.to_string()),
+            ("prio".into(), prio.to_string()),
         ],
     }
 }

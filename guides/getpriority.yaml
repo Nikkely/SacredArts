@@ -1,0 +1,63 @@
+name: getpriority
+executable: true
+category: scheduling
+summary: プロセスのスケジューリング優先度（nice 値）を取得する
+description: |
+  getpriority は、プロセス・プロセスグループ・ユーザーの nice 値を調べるシステムコールです。
+  nice 値は -20（最も優先）〜 19（最も譲る）の範囲で、CPU を取り合ったときの取り分を決めます。
+purpose: |
+  Linux のスケジューラは nice 値を「重み」に変換し、重みの比で CPU 時間を配分します
+  （nice 0 の重みは 1024、nice 19 は 15、nice -20 は 88761。nice が 1 違うと取り分は約 1.25 倍違う）。
+  getpriority はその元になる nice 値を読み出します。
+signature: |
+  #include <sys/resource.h>
+
+  int getpriority(int which, id_t who);
+arguments:
+  - name: which
+    type: int
+    description: 対象の種類。PRIO_PROCESS（プロセス）、PRIO_PGRP（プロセスグループ）、PRIO_USER（ユーザーの全プロセス）。
+  - name: who
+    type: id_t
+    description: which に応じた PID / PGID / UID。0 は「呼び出し元自身」（自分のプロセス・グループ・ユーザー）。
+return_value: |
+  生のシステムコールは「20 - nice」（1〜40）を返します。nice が負のとき戻り値が負になり、エラー（-1）と区別できなくなるのを避けるためです。
+  glibc の getpriority() はこれを nice 値に戻してから返します。SacredArts はカーネルの生の値を表示します。
+  対象が複数（PRIO_PGRP / PRIO_USER）のときは、その中で最も優先度が高い（nice が小さい）値を返します。
+  失敗すると -1（errno を設定）。
+errors:
+  - name: ESRCH
+    description: which と who の組み合わせに当てはまるプロセスがない。
+  - name: EINVAL
+    description: which が PRIO_PROCESS / PRIO_PGRP / PRIO_USER のどれでもない。
+  - name: EPERM
+    description: SacredArts では seccomp ポリシーで getpriority を deny したときにカーネルが返します。
+flags: []
+concepts:
+  - name: nice 値
+    description: |
+      「他のプロセスにどれだけ譲るか」を表す値です。大きいほど親切（CPU を譲る）で、小さいほどわがまま（CPU を多く取る）です。
+  - name: CFS / EEVDF の重み
+    description: |
+      スケジューラは nice を重み（sched_prio_to_weight 表）に変換し、実行可能なプロセスの重みの比で CPU 時間を配分します。
+      CPU を取り合っていなければ nice は何も変えません。
+  - name: /proc/<pid>/stat
+    description: |
+      18 番目のフィールドが priority（= 20 + nice）、19 番目が nice です。openat と read で読んで、getpriority の結果と見比べられます。
+state_changes:
+  - 状態は変化しません（読み取りのみ）。
+related:
+  - setpriority
+  - getpid
+man_pages:
+  - getpriority(2)
+  - sched(7)
+  - proc_pid_stat(5)
+explain:
+  success: |
+    {which} の対象（who={who}）について、カーネルは {ret} を返しました。これは「20 - nice」なので、nice 値は {nice} です。
+  failure: |
+    {which}（who={who}）の優先度を取得できませんでした。エラーは `{errno}`（{errno_message}）です。
+notes:
+  - |
+    nice 値は本来スレッドごとの属性です。PRIO_PROCESS に渡す who はカーネル内ではスレッド ID（TID）として扱われます。

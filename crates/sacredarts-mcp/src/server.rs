@@ -34,7 +34,7 @@ impl From<TraceModeParam> for TraceMode {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PolicyParam {
-    /// Syscalls to deny with seccomp (subset of: getpid, openat, read, write, close, mkdirat).
+    /// Syscalls to deny with seccomp (subset of: getpid, openat, read, write, close, mkdirat, getpriority, setpriority).
     #[serde(default)]
     pub deny: Vec<String>,
     /// errno name returned for denied syscalls, e.g. EPERM (default), ENOSYS, EIO; any errno name Linux defines.
@@ -55,7 +55,7 @@ pub struct SandboxCreateParams {
 pub struct SyscallInvokeParams {
     /// Session returned by sandbox_create.
     pub session_id: String,
-    /// One of: getpid, openat, read, write, close, mkdirat.
+    /// One of: getpid, openat, read, write, close, mkdirat, getpriority, setpriority.
     pub name: String,
     /// Syscall arguments (see the tool description for each syscall).
     pub args: Option<Map<String, Value>>,
@@ -63,7 +63,7 @@ pub struct SyscallInvokeParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SyscallDescribeParams {
-    /// Syscall name: getpid, openat, read, write, close, mkdirat, or open (description only).
+    /// Syscall name: getpid, openat, read, write, close, mkdirat, getpriority, setpriority, or open (description only).
     pub name: String,
     /// 1-3 (default 1).
     pub guide_level: Option<u8>,
@@ -170,6 +170,9 @@ Arguments are passed to the kernel verbatim and the kernel decides (EBADF, EMFIL
 - write: {"fd": <int>, "data": "...", "encoding"?: "utf8"|"base64", "count"?: <bytes, default all>}
 - close: {"fd": <int>}
 - mkdirat: {"dirfd"?: "AT_FDCWD" | <fd>, "path": "...", "mode"?: "0755" | <int>}
+- getpriority: {"which"?: "PRIO_PROCESS"|"PRIO_PGRP"|"PRIO_USER" | <int> (default PRIO_PROCESS), "who"?: <int> (0 = caller, default)}
+  Returns the raw kernel value 20 - nice (1..40), not the nice value itself.
+- setpriority: {"which"?: as above, "who"?: <int>, "prio": <int>}  (the kernel clamps prio to -20..19; lowering nice needs CAP_SYS_NICE, which the sandbox lacks)
 Any fd number may be used except the runner's own socket to the supervisor (rejected as reserved_fd). RLIMIT_NOFILE is 256. cwd is /workspace; the container is non-root with a read-only root filesystem (/workspace and /tmp are writable). A failing syscall (errno) is a normal result with success=false; tool errors are only for arguments that cannot be marshalled or infrastructure problems."#;
 
 #[tool_router(router = tool_router)]
@@ -600,7 +603,7 @@ impl ServerHandler for SacredArts {
             .with_instructions(format!(
                 "SacredArts — AI-powered Linux System Call Laboratory. Invoke. Observe. Understand.\n\
                  {}\n\
-                 Typical flow: sandbox_create -> syscall_invoke (openat/write/read/close/mkdirat/getpid) -> trace_get / sandbox_inspect -> sandbox_destroy.\n\
+                 Typical flow: sandbox_create -> syscall_invoke (openat/write/read/close/mkdirat/getpid/getpriority/setpriority) -> trace_get / sandbox_inspect -> sandbox_destroy.\n\
                  Supported syscalls: {}. cwd is /workspace; any path may be used and the kernel decides (non-root, read-only root fs). Arguments (fds, flags, modes, paths) go to the kernel verbatim; openat returns the real fd.\n\
                  guide_level 1-3 controls explanation detail; trace_mode requested|all controls whether strace-observed kernel syscalls are shown.\n\
                  policy_set installs a kernel seccomp filter (runner is recreated, open fds are lost).",

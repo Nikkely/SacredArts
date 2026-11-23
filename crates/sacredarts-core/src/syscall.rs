@@ -29,6 +29,8 @@ pub enum SyscallName {
     Write,
     Close,
     Mkdirat,
+    Getpriority,
+    Setpriority,
 }
 
 impl SyscallName {
@@ -51,7 +53,7 @@ mod tests {
         }
         assert_eq!(
             SyscallName::VARIANTS.join(","),
-            "getpid,openat,read,write,close,mkdirat"
+            "getpid,openat,read,write,close,mkdirat,getpriority,setpriority"
         );
         assert!("open".parse::<SyscallName>().is_err());
         assert!("OPENAT".parse::<SyscallName>().is_err());
